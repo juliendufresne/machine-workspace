@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# The remove action: reverse the reversible edits a workspace made and forget it.
+# With no name it drives the removal menu - a checklist of the registered
+# workspaces and a prompt for whether to also delete the generated keys - then
+# removes the chosen ones; with a name it skips the menu, asks only the keys
+# question, and removes just that one (exiting 2 when no such workspace exists).
+# Removal unlinks the marked ~/.gitconfig IncludeIf block and each host's
+# ~/.ssh/config.d block, optionally removes the generated GPG and SSH keys (kept by
+# default, since their public halves may still be registered with a provider),
+# removes the directory tree only when it holds nothing but what we recorded
+# creating, and deregisters the workspace. The shared registry/query primitives
+# live in lib/workspace.sh.
+
+# ─── Functions ────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   remove::ask_should_remove_keys
+#
+# Description:
+#   Asks whether to also delete the generated GPG and SSH keys, defaulting to
+#   keeping them - their public halves may still be registered with a provider, and
+#   the GPG key is shared by email, so another workspace on the same identity may
+#   still rely on it - and prints the answer (yes or no) to stdout. Split from the
+#   checklist so the named removal path can ask the keys question on its own, without
+#   driving the menu. A cancelled prompt prints no, keeping the keys. Drives the
+#   prompt on the terminal and writes the answer to stdout.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   remove_keys="$(remove::ask_should_remove_keys)"
+#--------------------------------------------------
+remove::ask_should_remove_keys() {
+    PROMPT_HELP='Removing the keys deletes the generated GPG and SSH keys; their public halves may still be registered with a provider, and the GPG key may be shared by another workspace that uses the same git identity.' \
+        prompt::select_one 'also remove the generated GPG and SSH keys?' \
+        "$(printf 'no\tkeep the keys')" \
+        "$(printf 'yes\tremove the keys (may break another workspace sharing the GPG key)')" || printf 'no'
+}
+[[ -v TEST_FLAG ]] || readonly -f remove::ask_should_remove_keys
+
+#--------------------------------------------------
+# Function:
+#   remove::ssh_config_host_files <name>
+#
+# Description:
+#   Removes each of a workspace's per-host ~/.ssh/config.d blocks: for every host the
+#   workspace grants access to (workspace::ssh::hosts) it removes the host's config block
+#   (ssh_config::host::remove), which leaves an absent block alone. Only the config
+#   blocks are touched here, never the keys themselves. Edits the shared ~/.ssh config
+#   under $HOME.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#   the failing step's exit status when a removal fails
+#
+# Example:
+#   remove::ssh_config_host_files Personal
+#--------------------------------------------------
+remove::ssh_config_host_files() {
+    local host
+    local name
+    local slug
+
+    name="$1"
+    slug="$(workspace::slug "$name")"
+
+    while IFS= read -r host
+    do
+        [[ -n "$host" ]] || continue
+
+        ssh_config::host::remove "$host" "$slug" || return $?
+    done < <(workspace::ssh::hosts "$name")
+}
+[[ -v TEST_FLAG ]] || readonly -f remove::ssh_config_host_files
+
+#--------------------------------------------------
+# Function:
+#   remove::ssh_keys <name>
+#
+# Description:
+#   Removes a workspace's generated SSH key files: each unique SSH key its hosts map
+#   to (workspace.<slug>.ssh.host.<host>.key, defaulting to the slug) and each
+#   host-less extra key (workspace.<slug>.ssh.extra_keys), removed once through a
+#   keyseen dedup so a key shared across hosts is deleted a single time. The actual
+#   per-key file teardown (the private and public halves, behind output::run) is
+#   delegated to ssh_key::remove in lib/ssh_key.sh. The caller (remove::keys) gates this
+#   on its keys answer and handles the GPG key; this function only ever removes SSH
+#   key files. Removes the key files under $HOME.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#   the failing step's exit status when a removal fails
+#
+# Example:
+#   remove::ssh_keys Personal
+#--------------------------------------------------
+remove::ssh_keys() {
+    local host
+    local keyname
+    local -A keyseen
+    local name
+    local raw
+    local slug
+
+    name="$1"
+    slug="$(workspace::slug "$name")"
+
+    # Each unique SSH key the workspace's hosts map to, removed once.
+    keyseen=()
+    while IFS= read -r host
+    do
+        [[ -n "$host" ]] || continue
+
+        keyname="$(state::input "workspace.$slug.ssh.host.$host.key" 2>/dev/null || true)"
+        [[ -n "$keyname" ]] || keyname="$slug"
+        [[ -z "${keyseen[$keyname]:-}" ]] || continue
+        keyseen["$keyname"]=1
+
+        ssh_key::remove "$keyname" || return $?
+    done < <(workspace::ssh::hosts "$name")
+
+    # Each host-less extra key, removed once.
+    raw="$(state::input "workspace.$slug.ssh.extra_keys" 2>/dev/null || true)"
+    while IFS= read -r keyname
+    do
+        [[ -n "$keyname" ]] || continue
+        [[ -z "${keyseen[$keyname]:-}" ]] || continue
+        keyseen["$keyname"]=1
+
+        ssh_key::remove "$keyname" || return $?
+    done <<<"$raw"
+}
+[[ -v TEST_FLAG ]] || readonly -f remove::ssh_keys
+
+#--------------------------------------------------
+# Function:
+#   remove::keys <name>
+#
+# Description:
+#   Removes a workspace's generated keys: the GPG signing key for the workspace's
+#   identity (gpg::remove_by_id, when one exists), then the generated SSH key files
+#   (remove::ssh_keys - each host's key and each host-less extra key, the private and
+#   public halves of each). The caller (remove::remove_one) gates this on its keys
+#   answer, since the keys are otherwise deliberately left in place: their public
+#   halves may still be registered with a provider. Removes the key files and the GPG
+#   key.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#   the failing step's exit status when a removal fails
+#
+# Example:
+#   remove::keys Personal
+#--------------------------------------------------
+remove::keys() {
+    local email
+    local name
+    local signingkey
+
+    name="$1"
+
+    # The GPG signing key for this workspace's identity, when one is still present.
+    email="$(workspace::git::user_email "$name" 2>/dev/null || true)"
+    if [[ -n "$email" ]] && signingkey="$(gpg::key_id_from_email "$email" 2>/dev/null)"
+    then
+        output::run "Removing the GPG key for $name" gpg::remove_by_id "$signingkey" || return $?
+    fi
+
+    # The generated SSH key files: each host's key and each host-less extra key.
+    remove::ssh_keys "$name"
+}
+[[ -v TEST_FLAG ]] || readonly -f remove::keys
+
+#--------------------------------------------------
+# Function:
+#   remove::deregister <name>
+#
+# Description:
+#   Removes a workspace from the registry once it has been removed: drops its
+#   name from workspace.list (rewriting the list in definition order, or clearing it
+#   when it was the last one), deletes every slug-namespaced input it owns
+#   (workspace.<slug>.*) and forgets its manifest (workspace@<slug>). Without this a
+#   removed workspace would still be listed and offered as an edit on the next run,
+#   pre-filled with its old path and identity. The rolling workspace.last.* defaults
+#   are deliberately left untouched, so the next new workspace still pre-fills with
+#   the last identity used. Writes the registry inputs and removes input files.
+#
+# Arguments:
+#   <name>  The workspace display name to deregister
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   remove::deregister Personal
+#--------------------------------------------------
+remove::deregister() {
+    local name
+    local slug
+
+    name="$1"
+    slug="$(workspace::slug "$name")"
+
+    state::unset_prefix "workspace.$slug."
+    state::commit_line_remove workspace.list "$name"
+    state::forget "workspace@$slug"
+}
+[[ -v TEST_FLAG ]] || readonly -f remove::deregister
+
+#--------------------------------------------------
+# Function:
+#   remove::remove_one <name> <keys>
+#
+# Description:
+#   Removes one workspace, inline. It reverses the reversible edits - the IncludeIf
+#   block from ~/.gitconfig and each host's block from ~/.ssh/config
+#   (remove::ssh_config_host_files) - optionally
+#   removes the generated keys (remove::keys, only when <keys> is yes),
+#   removes the directory tree only when it holds nothing but what we recorded
+#   creating (state::contains_only_created; otherwise it is left in place with a
+#   warning), and finally deregisters it (remove::deregister) so a later run no
+#   longer lists it. Each step runs behind output::run. Edits the shared config
+#   files, may remove keys and the directory, and clears the registry inputs.
+#
+# Arguments:
+#   <name>  The workspace display name to remove
+#   <keys>  yes to also remove the generated keys, anything else to keep them
+#
+# Returns:
+#   0 on success
+#   the failing step's exit status when a step fails
+#
+# Example:
+#   remove::remove_one Personal no
+#--------------------------------------------------
+remove::remove_one() {
+    local name
+    local path
+    local remove_keys
+    local slug
+
+    name="$1"
+    remove_keys="$2"
+    slug="$(workspace::slug "$name")"
+
+    output::stage "Removing workspace $name"
+
+    if gitconfig::block::exist "$slug"
+    then
+        output::run "Unlinking $name from ~/.gitconfig" gitconfig::block::remove "$slug" || return $?
+    fi
+
+    remove::ssh_config_host_files "$name" || return $?
+
+    if [[ "$remove_keys" == yes ]]
+    then
+        remove::keys "$name" || return $?
+    fi
+
+    path="$(workspace::path "$name")"
+    if [[ -n "$path" && -d "$path" ]]
+    then
+        if state::contains_only_created "workspace@$slug" "$path"
+        then
+            output::run "Removing the workspace directory $path" rm -rf -- "$path" || return $?
+        else
+            output::warn "$path contains files we did not create; leaving it in place"
+        fi
+    fi
+
+    remove::deregister "$name"
+}
+[[ -v TEST_FLAG ]] || readonly -f remove::remove_one
+
+#--------------------------------------------------
+# Function:
+#   remove::interactive
+#
+# Description:
+#   Removes the workspaces chosen in the removal menu, inline. It drives the removal
+#   checklist (a list of the registered workspaces, each shown by name and path and
+#   pre-selected) and the keys prompt (remove::ask_should_remove_keys), then removes each selected
+#   workspace (remove::remove_one). With
+#   no terminal (the PROMPT_INPUT probe fails, as in an
+#   unattended run) it warns that the menu needs an interactive terminal and returns
+#   without removing anything, since it cannot ask which workspaces to remove. With no
+#   workspace registered it returns without driving the menu or
+#   prompting for keys. Warns on stderr, edits the shared config files, may remove
+#   keys and directories, and clears the registry inputs.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 on success
+#   the failing step's exit status when a step fails
+#
+# Example:
+#   remove::interactive
+#--------------------------------------------------
+remove::interactive() {
+    local -a entries
+    local name
+    local path
+    local remove_keys
+    local selected
+
+    # Drive the menu only with a terminal. Probe the prompt input the same way
+    # prompt::* does; without one we cannot ask which workspaces to remove, and an
+    # unattended run must not fall through to removing every workspace, so warn and
+    # leave rather than removing anything.
+    if ! { : <"${PROMPT_INPUT:-/dev/tty}"; } 2>/dev/null
+    then
+        output::warn 'the workspace removal menu needs an interactive terminal; pass a workspace name to run unattended'
+
+        return 0
+    fi
+
+    # The removal checklist: every registered workspace, shown by name and path and
+    # pre-selected. With none registered there is nothing to ask or remove.
+    entries=()
+    while IFS= read -r name
+    do
+        [[ -n "$name" ]] || continue
+
+        path="$(workspace::path "$name")"
+        entries+=("$(printf '1\t%s\t%s' "$name" "path: $path")")
+    done < <(workspace::list)
+    ((${#entries[@]} > 0)) || return 0
+
+    selected="$(PROMPT_HELP='A removed workspace is unlinked from ~/.gitconfig and ~/.ssh/config and its directory removed when empty.' \
+        prompt::select_multi 'Select the workspaces to remove. Arrows or j/k move, space toggles, Enter confirms.' \
+        "${entries[@]}")"
+    remove_keys="$(remove::ask_should_remove_keys)"
+
+    while IFS= read -r name
+    do
+        [[ -n "$name" ]] || continue
+
+        remove::remove_one "$name" "$remove_keys" || return $?
+    done <<<"$selected"
+}
+[[ -v TEST_FLAG ]] || readonly -f remove::interactive
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   remove::main [<name>]
+#
+# Description:
+#   The remove action's entry point. With no name it runs the interactive,
+#   menu-driven removal (remove::interactive) over the chosen workspaces, or warns and
+#   returns when no workspace is registered. With a name it skips the menu: it fails when no such
+#   workspace
+#   exists, otherwise it asks only the keys question (remove::ask_should_remove_keys) and removes
+#   just that one (remove::remove_one). Writes the usage error to stderr; otherwise
+#   drives the menus and prompts on the terminal, edits the shared config files, may
+#   remove keys and directories, and clears the registry inputs.
+#
+# Arguments:
+#   <name>  Optional workspace display name to scope removal to
+#
+# Returns:
+#   0 on success
+#   2 when a name is given but no such workspace exists
+#   the failing step's exit status when a step fails
+#
+# Example:
+#   remove::main Personal
+#--------------------------------------------------
+remove::main() {
+    local name
+    local remove_keys
+
+    name="${1:-}"
+
+    # No name: the interactive, menu-driven removal. With no workspace registered there is
+    # nothing to remove, so warn and leave rather than driving the menu on an empty
+    # list.
+    if [[ -z "$name" ]]
+    then
+        if [[ -z "$(workspace::list)" ]]
+        then
+            output::warn 'no workspaces registered; nothing to remove'
+
+            return 0
+        fi
+
+        remove::interactive
+
+        return 0
+    fi
+
+    # A name scopes removal to one workspace.
+    if ! workspace::exists "$name"
+    then
+        output::fatal "no such workspace: $name"
+
+        return 2
+    fi
+
+    # Ask the keys question alone, then remove just this one.
+    remove_keys="$(remove::ask_should_remove_keys)"
+
+    remove::remove_one "$name" "$remove_keys"
+}
+[[ -v TEST_FLAG ]] || readonly -f remove::main
+
+# ─── Constants / globals ────────────────────────────────────────────────────────
+
+# Repository root, resolved from this script's own location (libexec/remove ->
+# root), so the action finds its libraries regardless of the caller's working
+# directory. Resolved only when unset, so the entrypoint - which sources this script
+# with PROJECT_ROOT already set - does not reassign its readonly value. Made readonly
+# outside tests so specs can reassign it.
+[[ -v PROJECT_ROOT ]] || PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ -v TEST_FLAG ]] || readonly PROJECT_ROOT
+
+# ─── Imports ──────────────────────────────────────────────────────────────────
+# shellcheck source=lib/state.sh
+source "$PROJECT_ROOT/lib/state.sh"
+# shellcheck source=lib/output.sh
+source "$PROJECT_ROOT/lib/output.sh"
+# shellcheck source=lib/prompt.sh
+source "$PROJECT_ROOT/lib/prompt.sh"
+# shellcheck source=lib/gpg.sh
+source "$PROJECT_ROOT/lib/gpg.sh"
+# shellcheck source=lib/gitconfig.sh
+source "$PROJECT_ROOT/lib/gitconfig.sh"
+# shellcheck source=lib/workspace.sh
+source "$PROJECT_ROOT/lib/workspace.sh"
+# shellcheck source=lib/ssh_config.sh
+source "$PROJECT_ROOT/lib/ssh_config.sh"
+# shellcheck source=lib/ssh_key.sh
+source "$PROJECT_ROOT/lib/ssh_key.sh"
+
+# ─── Execute ──────────────────────────────────────────────────────────────────
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || remove::main "$@"
