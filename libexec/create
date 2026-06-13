@@ -1,0 +1,724 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# The create action: define and provision one or more workspaces, inline and step
+# by step. With no name it drives a looping menu (edit a registered workspace,
+# create a new one, or exit) and, for each workspace chosen, prompts and
+# provisions in one inline pass before returning to the menu; with a name it skips
+# the menu and scopes the run to that one workspace - editing it when it exists,
+# else defining it from the path question on. There is no separate provisioning
+# pass: each answer is acted on the moment it is given (the directory created, the
+# gitconfig written, a key generated). The flow is plain and scrolling - it uses
+# the prompt::* primitives and inline output::run, with the
+# provisioning output printed between prompts. A passphrase is collected with a
+# hidden prompt at the moment its key is generated, kept in a local variable,
+# passed straight into keygen, and never stored. Provisioning writes only under
+# $HOME (no apt, no sudo): it creates the directory tree, generates the GPG key,
+# writes the per-tree .gitconfig and the reversible ~/.gitconfig IncludeIf block,
+# and provisions the SSH keys. The SSH key step is delegated to manage_ssh_keys::menu
+# in libexec/manage-ssh-keys (the keys, the ~/.ssh/config.d blocks, the agent load and the provider
+# registration), scoped to the current workspace so it never re-asks which workspace.
+# The shared registry/query primitives live in lib/workspace.sh.
+
+# ─── Functions ────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   create::ask_name
+#
+# Description:
+#   Prompts for a new workspace's display name and prints it to stdout. It offers
+#   Personal as the default only when no Personal workspace exists yet (otherwise
+#   no default, and a blank entry is rejected), and re-prompts on a blank or a
+#   duplicate name, carrying the reason into the next prompt's help line
+#   (PROMPT_HELP). A lone Escape cancels. Reads the name on the terminal through
+#   prompt::ask; stdout carries only the chosen name.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 when a name was chosen (printed to stdout)
+#   2 when the user cancelled
+#
+# Example:
+#   name="$(create::ask_name)" || { (($? == 2)) && return 2; }
+#--------------------------------------------------
+create::ask_name() {
+    local chosen
+    local help
+
+    help='Names this workspace and labels its git identity and SSH keys.'
+    while true
+    do
+        if workspace::exists Personal
+        then
+            chosen="$(PROMPT_HELP="$help" prompt::ask 'name (e.g. Acme, Work)')" || return $?
+        else
+            chosen="$(PROMPT_HELP="$help" prompt::ask 'name (e.g. Personal, Acme)' Personal)" || return $?
+        fi
+
+        if [[ -z "$chosen" ]]
+        then
+            help='A workspace name is required.'
+
+            continue
+        fi
+
+        if workspace::exists "$chosen"
+        then
+            help="A workspace named $chosen already exists; choose another."
+
+            continue
+        fi
+
+        break
+    done
+
+    printf '%s' "$chosen"
+}
+[[ -v TEST_FLAG ]] || readonly -f create::ask_name
+
+#--------------------------------------------------
+# Function:
+#   create::ensure_dir <name> <mode>
+#
+# Description:
+#   Ensures a workspace's directory tree exists, reading the path from
+#   workspace.<slug>.path (set by create::one::path just before this call). A
+#   missing directory is created with mkdir -p and recorded in the workspace@<slug>
+#   manifest, so uninstall can tell a tree we created from one the user has since
+#   filled. A path that exists but is not a directory (a regular file, or a symlink
+#   to one) is rejected in either mode: a warning is printed and 1 is returned so
+#   create::one::path re-prompts. For mode=new an already-existing directory is
+#   likewise treated as a collision and re-prompted; for mode=edit an existing
+#   directory is accepted as is. Each creation step runs behind output::run. Writes
+#   only under $HOME; warns on stderr.
+#
+# Arguments:
+#   <name>  The workspace display name
+#   <mode>  new (reject an existing path) or edit (accept an existing path)
+#
+# Returns:
+#   0 when the directory exists or was created
+#   1 when the path exists but is not a directory (signal a re-prompt)
+#   1 when mode is new and the path already exists (signal a re-prompt)
+#   the failing step's exit status when creation fails
+#
+# Example:
+#   create::ensure_dir Personal new
+#--------------------------------------------------
+create::ensure_dir() {
+    local mode
+    local name
+    local path
+    local slug
+
+    name="$1"
+    mode="$2"
+    slug="$(workspace::slug "$name")"
+    path="$(state::input "workspace.$slug.path" 2>/dev/null || true)"
+
+    if [[ -e "$path" || -L "$path" ]] && [[ ! -d "$path" ]]
+    then
+        output::warn "$path exists but is not a directory; choose another path"
+
+        return 1
+    fi
+
+    if [[ -d "$path" ]]
+    then
+        if [[ "$mode" == new ]]
+        then
+            output::warn "$path already exists; choose a path that does not yet exist"
+
+            return 1
+        fi
+
+        return 0
+    fi
+
+    output::run "Creating the workspace directory $path" mkdir -p -- "$path" || return $?
+    state::created "workspace@$slug" "$path"
+}
+[[ -v TEST_FLAG ]] || readonly -f create::ensure_dir
+
+#--------------------------------------------------
+# Function:
+#   create::one::path <name> <mode> <path_var>
+#
+# Description:
+#   Prompts for a workspace's directory path, persists it to workspace.<slug>.path,
+#   creates it (create::ensure_dir), and writes the resolved path into the caller's
+#   <path_var> (a nameref out-param) so the caller need not read it back through
+#   workspace::path. The default is the existing path on an edit, otherwise
+#   ~/Workspace/<name>; an answer without a leading slash is taken as relative to
+#   ~/Workspace. The prompt loops: for mode=new a path that already exists is
+#   rejected and re-prompted (mirroring create::ask_name's duplicate handling),
+#   while mode=edit accepts an existing path. A lone Escape cancels before
+#   <path_var> is set. Reads the path on the terminal, writes the input, and creates
+#   the directory under $HOME.
+#
+# Arguments:
+#   <name>      The workspace display name
+#   <mode>      new (re-prompt a path collision) or edit (accept an existing path)
+#   <path_var>  Name of the caller's variable to receive the resolved path
+#
+# Returns:
+#   0 on success
+#   2 when the user cancelled
+#   the failing step's exit status when directory creation fails
+#
+# Example:
+#   local path
+#   create::one::path Personal new path
+#--------------------------------------------------
+create::one::path() {
+    local default
+    local mode
+    local name
+    local -n path_ref
+    local slug
+    local value
+
+    name="$1"
+    mode="$2"
+    path_ref="$3"                                 # bind the out-param to the caller's variable
+    slug="$(workspace::slug "$name")"
+
+    default="$(state::input "workspace.$slug.path" 2>/dev/null || true)"
+    [[ -n "$default" ]] || default="$HOME/Workspace/$name"
+
+    while true
+    do
+        value="$(PROMPT_HELP="Where this workspace's repositories live; a relative answer lands under ~/Workspace." prompt::ask "workspace path for $name" "$default")" || return $?
+        [[ "$value" == /* ]] || value="$HOME/Workspace/$value"   # a relative answer lands under ~/Workspace
+
+        state::set "workspace.$slug.path" "$value"
+
+        create::ensure_dir "$name" "$mode" && break
+        default="$value"
+    done
+
+    # shellcheck disable=SC2034  # nameref out-param: this write reaches the caller's variable
+    path_ref="$value"
+}
+[[ -v TEST_FLAG ]] || readonly -f create::one::path
+
+#--------------------------------------------------
+# Function:
+#   create::one::register_name <name>
+#
+# Description:
+#   Registers a workspace display name: records its slug-to-name mapping
+#   (workspace.<slug>.display) and appends the name to workspace.list, in
+#   definition order, unless a workspace with the same slug is already listed.
+#   Called as soon as the workspace's directory exists on disk, so a workspace
+#   becomes listed (and resumable from the menu) the moment it has a home, even if a
+#   later provisioning step is cancelled. Writes the registry inputs.
+#
+# Arguments:
+#   <name>  The workspace display name to register
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   create::one::register_name Personal
+#--------------------------------------------------
+create::one::register_name() {
+    local list
+    local name
+    local slug
+
+    name="$1"
+    slug="$(workspace::slug "$name")"
+
+    state::set "workspace.$slug.display" "$name"
+    workspace::exists "$name" && return 0         # already listed under this slug
+
+    list="$(workspace::list)"
+    if [[ -n "$list" ]]
+    then
+        state::set workspace.list "$(printf '%s\n%s' "$list" "$name")"
+    else
+        state::set workspace.list "$name"
+    fi
+}
+[[ -v TEST_FLAG ]] || readonly -f create::one::register_name
+
+#--------------------------------------------------
+# Function:
+#   create::one::mark_directory::write <file> <name> <repo>
+#
+# Description:
+#   Writes the workspace marker to <file> (the .workspace-managed stamp at the root
+#   of the workspace tree): a plain-text notice that the directory is managed by the
+#   workspace tool, naming the workspace and the path of the managing repository so
+#   anyone who stumbles on the file knows what owns the tree and where to manage it.
+#   The whole file is rewritten, which the workspace owns, so re-running is
+#   idempotent. The marker is recorded in the workspace@<slug> manifest by the caller
+#   so uninstall can remove it. Writes the marker file.
+#
+# Arguments:
+#   <file>  Path of the marker file to write
+#   <name>  The workspace display name
+#   <repo>  Path of the workspace tool's repository (its managing root)
+#
+# Returns:
+#   0 on success
+#   non-zero when the write fails
+#
+# Example:
+#   create::one::mark_directory::write ~/Workspace/Personal/.workspace-managed Personal ~/src/machine-workspace
+#--------------------------------------------------
+create::one::mark_directory::write() {
+    local file
+    local name
+    local repo
+
+    file="$1"
+    name="$2"
+    repo="$3"
+
+    {
+        printf 'This directory is managed by the workspace tool.\n'
+        printf '\n'
+        printf 'Its git identity, and any SSH and GPG keys, are provisioned by workspace, and\n'
+        printf 'the generated .gitconfig here is linked into ~/.gitconfig. Manage this workspace\n'
+        printf 'with the workspace command rather than editing the generated files by hand.\n'
+        printf '\n'
+        printf 'Workspace:  %s\n' "$name"
+        printf 'Managed by: %s\n' "$repo"
+    } >"$file"
+}
+[[ -v TEST_FLAG ]] || readonly -f create::one::mark_directory::write
+
+#--------------------------------------------------
+# Function:
+#   create::one::mark_directory <name> <path>
+#
+# Description:
+#   Stamps the .workspace-managed marker at the root of a workspace tree. It records
+#   the marker in the workspace@<slug> manifest on first creation (so uninstall can
+#   remove it), then writes the marker (create::one::mark_directory::write) with
+#   the workspace name and the managing repository root ($PROJECT_ROOT). Derives the slug and
+#   marker path from <name> and <path>. The write runs behind output::run. Re-running
+#   is idempotent. Writes the marker file under $HOME.
+#
+# Arguments:
+#   <name>  The workspace display name
+#   <path>  The workspace's directory path (its tree root)
+#
+# Returns:
+#   0 on success
+#   the failing step's exit status when the write fails
+#
+# Example:
+#   create::one::mark_directory Personal ~/Workspace/Personal
+#--------------------------------------------------
+create::one::mark_directory() {
+    local marker
+    local name
+    local path
+    local slug
+
+    name="$1"
+    path="$2"
+    slug="$(workspace::slug "$name")"
+
+    marker="$path/.workspace-managed"
+    [[ -f "$marker" ]] || state::created "workspace@$slug" "$marker"
+    output::run "Stamping the workspace marker in $path" create::one::mark_directory::write "$marker" "$name" "$PROJECT_ROOT"
+}
+[[ -v TEST_FLAG ]] || readonly -f create::one::mark_directory
+
+#--------------------------------------------------
+# Function:
+#   create::one::gitconfig <name>
+#
+# Description:
+#   Provisions a workspace's git identity step: prompts for user.name and
+#   user.email and persists the rolling defaults workspace.last.user.name / .email
+#   so the next workspace pre-fills with the last identity used (each default
+#   resolves as the workspace's own value read back from its .gitconfig on an edit,
+#   then the rolling last.* value, then the hardcoded Julien
+#   Dufresne / git@dfrsn.me), writes only user.name and user.email into the per-tree
+#   .gitconfig with git config -f (the GPG signing keys are create::one::gpg's
+#   concern, not touched here), recording the file in the workspace@<slug> manifest
+#   on first creation, and links the tree into ~/.gitconfig with a slug-keyed
+#   IncludeIf block (gitconfig::block::add) when one is not already present. Derives
+#   the path, slug and gitconfig from <name>. The identity writes are quick git
+#   config calls run inline (no output::run). A lone Escape in the identity prompt
+#   cancels before anything is written. Reads on the terminal and writes the inputs
+#   and the gitconfig under $HOME.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#   2 when the user cancelled
+#   the failing step's exit status when a step fails
+#
+# Example:
+#   create::one::gitconfig Personal
+#--------------------------------------------------
+create::one::gitconfig() {
+    local email
+    local email_default
+    local gitconfig
+    local name
+    local name_default
+    local path
+    local slug
+    local user_name
+
+    name="$1"
+    slug="$(workspace::slug "$name")"
+    path="$(workspace::path "$name")"
+    gitconfig="$path/.gitconfig"
+
+    name_default="$(workspace::git::user_name "$name" 2>/dev/null || true)"
+    [[ -n "$name_default" ]] || name_default="$(state::input workspace.last.user.name 2>/dev/null || true)"
+    [[ -n "$name_default" ]] || name_default='Julien Dufresne'
+    user_name="$(PROMPT_HELP='The git author name for commits made in this workspace.' prompt::ask "git user.name for $name" "$name_default")" || return $?
+
+    email_default="$(workspace::git::user_email "$name" 2>/dev/null || true)"
+    [[ -n "$email_default" ]] || email_default="$(state::input workspace.last.user.email 2>/dev/null || true)"
+    [[ -n "$email_default" ]] || email_default='git@dfrsn.me'
+    email="$(PROMPT_HELP='The git author email for commits made in this workspace.' prompt::ask "git user.email for $name" "$email_default")" || return $?
+
+    state::set workspace.last.user.name "$user_name"
+    state::set workspace.last.user.email "$email"
+
+    [[ -f "$gitconfig" ]] || state::created "workspace@$slug" "$gitconfig"
+
+    # Only the user identity here; the GPG signing keys are create::one::gpg's
+    # concern. These are quick git config calls, so they run inline.
+    git config -f "$gitconfig" user.name "$user_name" || return $?
+    git config -f "$gitconfig" user.email "$email" || return $?
+
+    if ! gitconfig::block::exist "$slug"
+    then
+        output::run "Linking $name into ~/.gitconfig" gitconfig::block::add "$slug" "$path" "$gitconfig" || return $?
+    fi
+}
+[[ -v TEST_FLAG ]] || readonly -f create::one::gitconfig
+
+#--------------------------------------------------
+# Function:
+#   create::one::gpg <name>
+#
+# Description:
+#   Provisions a workspace's GPG signing key step in one pass: ask, then generate.
+#   It derives the email and gitconfig from <name>. When a key already exists for the
+#   email it reports the reuse (output::info) and skips generation, but the key itself
+#   is never recreated.
+#   Otherwise it asks whether to create one; declining returns without generating
+#   anything, while accepting collects the key type (ed25519 or rsa, and an RSA
+#   length) and a comment, prompts for the passphrase with a hidden prompt
+#   (prompt::ask_secret), generates the key unattended (gpg::generate),
+#   writes only the signing keys into the workspace gitconfig with git config -f
+#   (user.signingKey plus commit.gpgsign and tag.gpgsign; the user identity is
+#   create::one::gitconfig's concern, not touched here), and shows the key for
+#   confirm-and-trust registration (gpg::register). The settings flow straight into
+#   generation rather than through the state store, and the passphrase is kept in a
+#   local and never stored. The key generation runs behind output::run, but the
+#   signing config is written inline with quick git config calls. A lone Escape in a
+#   sub-prompt cancels. Reads on the terminal, writes the key into the caller's GnuPG
+#   home, and writes the signing config under $HOME.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success (including the no-ops for reuse and decline)
+#   2 when the user cancelled
+#   the failing step's exit status when a step fails
+#
+# Example:
+#   create::one::gpg Personal
+#--------------------------------------------------
+create::one::gpg() {
+    local bits
+    local comment
+    local create
+    local email
+    local gitconfig
+    local name
+    local passphrase
+    local signingkey
+    local type
+    local user_name
+
+    name="$1"
+    email="$(workspace::git::user_email "$name")"
+    gitconfig="$(workspace::path "$name")/.gitconfig"
+
+    if signingkey="$(gpg::key_id_from_email "$email")"
+    then
+        output::info "reusing the existing GPG key for $email"   # reuse, never recreate
+    else
+        create="$(PROMPT_HELP="Sign every commit and tag in $name with a GPG key for $email." prompt::select_one 'create a GPG signing key?' \
+            "$(printf 'no\tno signing key')" \
+            "$(printf 'yes\tcreate a GPG signing key')")" || return $?
+        if [[ "$create" != yes ]]                     # no key wanted
+        then
+            # A previous run (or edit) may have written signing config; clear it
+            # so the workspace stops signing. --unset exits 5 when the key is
+            # absent, which is not an error here.
+            git config -f "$gitconfig" --unset user.signingKey 2>/dev/null || true
+            git config -f "$gitconfig" --unset commit.gpgsign 2>/dev/null || true
+            git config -f "$gitconfig" --unset tag.gpgsign 2>/dev/null || true
+            return 0
+        fi
+
+        type="$(PROMPT_HELP='The signing key algorithm; ed25519 is recommended.' prompt::select_one 'GPG key type' \
+            "$(printf 'ed25519\ted25519 (recommended)')" \
+            "$(printf 'rsa\trsa')")" || return $?
+
+        bits=''
+        if [[ "$type" == rsa ]]
+        then
+            bits="$(PROMPT_HELP='The RSA key length in bits; longer is stronger but slower.' prompt::select_one 'RSA key length' \
+                "$(printf '2048\t2048')" \
+                "$(printf '4096\t4096')")" || return $?
+        fi
+
+        comment="$(PROMPT_HELP="A label stored in the GPG key's user id." prompt::ask "GPG key comment for $name" "workspace $name")" || return $?
+
+        user_name="$(workspace::git::user_name "$name")"
+
+        passphrase="$(prompt::ask_secret "GPG key passphrase for $name")"
+        output::run "Generating the GPG signing key for $name" gpg::generate "$user_name" "$email" "$passphrase" "$type" "$bits" "$comment" || return $?
+        signingkey="$(gpg::key_id_from_email "$email")"
+
+        gpg::register "$signingkey"
+    fi
+
+    # Only the signing keys here; the user identity is create::one::gitconfig's
+    # concern. These run for a reused key too, so the workspace gitconfig always
+    # points at the signing key. Quick git config calls, so they run inline.
+    git config -f "$gitconfig" user.signingKey "$signingkey" || return $?
+    git config -f "$gitconfig" commit.gpgsign true || return $?
+    git config -f "$gitconfig" tag.gpgsign true || return $?
+}
+[[ -v TEST_FLAG ]] || readonly -f create::one::gpg
+
+#--------------------------------------------------
+# Function:
+#   create::one <name> <mode>
+#
+# Description:
+#   Defines and provisions one workspace inline, in step order: the directory path
+#   (create::one::path, which creates the tree, writes the resolved path back
+#   to the caller, and, for mode=new, re-prompts a path collision), registering the
+#   workspace (create::one::register_name) and stamping the .workspace-managed
+#   marker (create::one::mark_directory) the moment the tree exists, the git identity
+#   (create::one::gitconfig) written to the per-tree .gitconfig and linked into
+#   ~/.gitconfig, the GPG signing key (create::one::gpg), and the SSH keys
+#   (manage_ssh_keys::menu, in libexec/manage-ssh-keys). The two steps write disjoint parts of the per-tree .gitconfig:
+#   create::one::gitconfig sets the user identity, create::one::gpg sets the signing
+#   keys when a key is generated. On success it prints a final confirmation line
+#   ("Workspace <name> created", or "edited" on an edit).
+#   mode is new (a fresh definition, where an existing path is a collision) or edit
+#   (an existing workspace). Any sub-prompt returning 2 (a lone Escape) aborts and
+#   returns 2. Reads on the terminal, writes the workspace inputs, and provisions
+#   under $HOME.
+#
+# Arguments:
+#   <name>  The workspace display name
+#   <mode>  new (a fresh definition) or edit (an existing workspace)
+#
+# Returns:
+#   0 on success
+#   2 when the user cancelled
+#   the failing step's exit status when a step fails
+#
+# Example:
+#   create::one Personal new
+#--------------------------------------------------
+create::one() {
+    local mode
+    local name
+    local path
+
+    name="$1"
+    mode="$2"
+
+    output::stage "Setting up workspace $name"
+
+    create::one::path "$name" "$mode" path || return $?
+
+    # Register and stamp the tree the moment it exists on disk, so a workspace whose
+    # directory was created is resumable from the menu even if a later step is
+    # cancelled, rather than orphaned as an unlisted directory.
+    create::one::register_name "$name"
+    create::one::mark_directory "$name" "$path" || return $?
+
+    create::one::gitconfig "$name" || return $?
+    create::one::gpg "$name" || return $?
+    manage_ssh_keys::menu "$name" || return $?
+
+    if [[ "$mode" == edit ]]
+    then
+        output::success "Workspace $name edited"
+    else
+        output::success "Workspace $name created"
+    fi
+}
+[[ -v TEST_FLAG ]] || readonly -f create::one
+
+#--------------------------------------------------
+# Function:
+#   create::interactive
+#
+# Description:
+#   Drives the looping workspace-creation menu. With a terminal it lists each
+#   registered workspace as an "edit <name> (path: <path>)" entry, then "create a
+#   new workspace" and "exit workspace creation", and loops: "create" asks for a
+#   name (create::ask_name) and provisions a new workspace (create::one ...
+#   new), "edit:<name>" provisions an existing one (create::one ... edit), and
+#   "exit" or Escape leaves. Each workspace is provisioned inline before the menu is
+#   redrawn; a cancelled name or sub-prompt is reported with output::info and the
+#   menu continues. With no terminal (the PROMPT_INPUT probe fails, as in an
+#   unattended run) it warns that the menu needs an interactive terminal and
+#   returns without doing anything, since it cannot prompt and there is no separate
+#   provisioning pass. Drives the menu on the terminal, warns on stderr, and
+#   provisions under $HOME.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   create::interactive
+#--------------------------------------------------
+create::interactive() {
+    local choice
+    local -a entries
+    local name
+    local path
+
+    # Drive the menu only with a terminal. Probe the prompt input the same way
+    # prompt::* does; an unattended run cannot drive the menu, since provisioning is
+    # inline and needs answers, so warn and leave rather than failing silently.
+    if ! { : <"${PROMPT_INPUT:-/dev/tty}"; } 2>/dev/null
+    then
+        output::warn 'the workspace menu needs an interactive terminal; pass a workspace name to run unattended'
+
+        return 0
+    fi
+
+    while true
+    do
+        entries=()
+        while IFS= read -r name
+        do
+            [[ -n "$name" ]] || continue
+
+            path="$(workspace::path "$name")"
+            entries+=("$(printf 'edit:%s\tedit %s (path: %s)' "$name" "$name" "$path")")
+        done < <(workspace::list)
+        entries+=("$(printf 'create\tcreate a new workspace')")
+        entries+=("$(printf 'exit\texit workspace creation')")
+
+        choice="$(PROMPT_HELP='Edit a registered workspace, create a new one, or exit.' prompt::select_one 'Workspace creation' "${entries[@]}")" || break
+
+        case "$choice" in
+            exit)
+                break
+                ;;
+            create)
+                name="$(create::ask_name)" || { output::info 'workspace creation cancelled'; continue; }
+                create::one "$name" new || output::info 'workspace creation cancelled'
+                ;;
+            edit:*)
+                create::one "${choice#edit:}" edit || output::info 'workspace edit cancelled'
+                ;;
+        esac
+    done
+}
+[[ -v TEST_FLAG ]] || readonly -f create::interactive
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   create::main [<name>]
+#
+# Description:
+#   The create action's entry point. With no name it drives the looping
+#   workspace-creation menu (create::interactive), provisioning each chosen workspace
+#   inline. With a name it skips the menu and scopes the run to that one workspace:
+#   an existing name is edited, a new one is defined from the path question on, both
+#   through create::one (mode edit or new). There is no separate provisioning
+#   pass - each answer is acted on as it is given. A cancelled named run (exit 2)
+#   returns 2. Drives the menus and prompts on the terminal and provisions under
+#   $HOME.
+#
+# Arguments:
+#   <name>  Optional workspace display name to scope the run to
+#
+# Returns:
+#   0 on success
+#   2 when a named run was cancelled
+#   the failing step's exit status when a step fails
+#
+# Example:
+#   create::main Personal
+#--------------------------------------------------
+create::main() {
+    local name
+
+    name="${1:-}"
+
+    # No name: the looping menu over every workspace, provisioning inline.
+    if [[ -z "$name" ]]
+    then
+        create::interactive
+
+        return 0
+    fi
+
+    # A name scopes the run to one workspace: edit it when it exists, else define it
+    # from the path question on.
+    if workspace::exists "$name"
+    then
+        create::one "$name" edit
+    else
+        create::one "$name" new
+    fi
+}
+[[ -v TEST_FLAG ]] || readonly -f create::main
+
+# ─── Constants / globals ────────────────────────────────────────────────────────
+
+# Repository root, resolved from this script's own location (libexec/create ->
+# root), so the action finds its libraries regardless of the caller's working
+# directory. Resolved only when unset, so the entrypoint - which sources this script
+# with PROJECT_ROOT already set - does not reassign its readonly value. Made readonly
+# outside tests so specs can reassign it.
+[[ -v PROJECT_ROOT ]] || PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ -v TEST_FLAG ]] || readonly PROJECT_ROOT
+
+# ─── Imports ──────────────────────────────────────────────────────────────────
+# shellcheck source=lib/state.sh
+source "$PROJECT_ROOT/lib/state.sh"
+# shellcheck source=lib/output.sh
+source "$PROJECT_ROOT/lib/output.sh"
+# shellcheck source=lib/prompt.sh
+source "$PROJECT_ROOT/lib/prompt.sh"
+# shellcheck source=lib/gpg.sh
+source "$PROJECT_ROOT/lib/gpg.sh"
+# shellcheck source=lib/gitconfig.sh
+source "$PROJECT_ROOT/lib/gitconfig.sh"
+# shellcheck source=lib/workspace.sh
+source "$PROJECT_ROOT/lib/workspace.sh"
+# shellcheck source=libexec/manage-ssh-keys
+source "$PROJECT_ROOT/libexec/manage-ssh-keys"
+
+# ─── Execute ──────────────────────────────────────────────────────────────────
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || create::main "$@"
