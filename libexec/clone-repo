@@ -1,0 +1,780 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# This script clones a repository through the SSH identity of the workspace it
+# sits in. A workspace gives each directory tree its own SSH key behind a host
+# alias (github.com-personal and the like); a clone URL copied from a provider
+# points at the bare host, so it would authenticate with the default key instead.
+# This helper rewrites that clone to go through the workspace's alias, so the
+# right key is used, and refuses (rather than falling back to the default key)
+# when the workspace has no key for the requested host.
+#
+# THIS IS A MANAGED FILE. A copy of it is placed at the root of each workspace,
+# and re-running the workspace tool overwrites that copy, so any local edit here
+# is lost. Edit the source in the repository (libexec/clone-repo) instead. The
+# script is self-contained: it sources nothing and bakes in no per-workspace
+# data, so the copy at every workspace root is byte-identical and figures out
+# which workspace it serves from its own location.
+
+# ─── Functions ────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::color_enabled <fd>
+#
+# Description:
+#   Reports whether coloured output should go to the given file descriptor,
+#   that is whether it is attached to a terminal. Output redirected to a file
+#   or a pipe (CI logs, command substitution) is left uncoloured. Writes
+#   nothing.
+#
+# Arguments:
+#   <fd>  File descriptor number to test (1 for stdout, 2 for stderr)
+#
+# Returns:
+#   0 when the descriptor is a terminal
+#   1 otherwise
+#
+# Example:
+#   clone_repo::color_enabled 1 && printf 'colours on\n'
+#--------------------------------------------------
+clone_repo::color_enabled() {
+    [[ -t "$1" ]]
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::color_enabled
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::stage <message>
+#
+# Description:
+#   Prints the top-level stage header, "▶ <message>", in bold magenta on a
+#   terminal and plain otherwise, preceded by a blank line. Writes to stdout.
+#
+# Arguments:
+#   <message>  Stage title
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   clone_repo::stage 'Clone'
+#--------------------------------------------------
+clone_repo::stage() {
+    local message
+
+    message="$1"
+
+    if clone_repo::color_enabled 1
+    then
+        printf '\n%b▶ %s%b\n' '\033[1;35m' "${message}" '\033[0m'
+
+        return 0
+    fi
+
+    printf '\n▶ %s\n' "${message}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::stage
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::fatal <message>
+#
+# Description:
+#   Prints a flush-left, program-level error, "error: <message>", red on a
+#   terminal and plain otherwise, for a failure that aborts the run. Writes to
+#   stderr.
+#
+# Arguments:
+#   <message>  Text to print
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   clone_repo::fatal 'git is not installed'
+#--------------------------------------------------
+clone_repo::fatal() {
+    local message
+
+    message="$1"
+
+    if clone_repo::color_enabled 2
+    then
+        printf '%berror: %s%b\n' '\033[0;31m' "${message}" '\033[0m' >&2
+
+        return 0
+    fi
+
+    printf 'error: %s\n' "${message}" >&2
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::fatal
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::warn <message>
+#
+# Description:
+#   Prints an indented warning line, "  ! <message>", yellow on a terminal and
+#   plain otherwise, for a non-fatal caution the user should see but that does
+#   not fail the run. Writes to stderr.
+#
+# Arguments:
+#   <message>  Text to print
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   clone_repo::warn 'the directory already exists'
+#--------------------------------------------------
+clone_repo::warn() {
+    local message
+
+    message="$1"
+
+    if clone_repo::color_enabled 2
+    then
+        printf '  %b! %s%b\n' '\033[0;33m' "${message}" '\033[0m' >&2
+
+        return 0
+    fi
+
+    printf '  ! %s\n' "${message}" >&2
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::warn
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::info <message>
+#
+# Description:
+#   Prints an indented info line, "  • <message>", dim on a terminal and plain
+#   otherwise, for routine progress. Writes to stdout.
+#
+# Arguments:
+#   <message>  Text to print
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   clone_repo::info 'cloning git@github.com-personal:o/r.git'
+#--------------------------------------------------
+clone_repo::info() {
+    local message
+
+    message="$1"
+
+    if clone_repo::color_enabled 1
+    then
+        printf '  %b• %s%b\n' '\033[2m' "${message}" '\033[0m'
+
+        return 0
+    fi
+
+    printf '  • %s\n' "${message}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::info
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::success <message>
+#
+# Description:
+#   Prints an indented success line, "  ✓ <message>", green on a terminal and
+#   plain otherwise. Writes to stdout.
+#
+# Arguments:
+#   <message>  Text to print
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   clone_repo::success 'cloned o/r into ~/Workspace/Personal/r'
+#--------------------------------------------------
+clone_repo::success() {
+    local message
+
+    message="$1"
+
+    if clone_repo::color_enabled 1
+    then
+        printf '  %b✓ %s%b\n' '\033[0;32m' "${message}" '\033[0m'
+
+        return 0
+    fi
+
+    printf '  ✓ %s\n' "${message}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::success
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::menu <prompt> <label>...
+#
+# Description:
+#   Presents a numbered menu and reads a choice. Writes the prompt, one
+#   numbered line per label and a "0) cancel" line to stderr, then reads one
+#   line from stdin. On a valid in-range selection it prints that 1-based number
+#   to stdout and succeeds; on 0, an empty line, a non-number or an out-of-range
+#   number it prints nothing and fails, which the caller treats as a cancel.
+#
+# Arguments:
+#   <prompt>   The heading shown above the options
+#   <label>... One or more option labels, in order
+#
+# Returns:
+#   0 and prints the chosen 1-based index on a valid selection
+#   1 when the selection is cancelled or invalid
+#
+# Example:
+#   choice="$( clone_repo::menu 'Pick a provider:' github.com gitlab.com )" || exit 1
+#--------------------------------------------------
+clone_repo::menu() {
+    local label
+    local prompt
+    local reply
+    local -i index
+    local -a labels
+
+    prompt="$1"
+    shift
+    labels=( "$@" )
+
+    printf '%s\n' "${prompt}" >&2
+    index=1
+    for label in "${labels[@]}"
+    do
+        printf '  %d) %s\n' "${index}" "${label}" >&2
+        index=$(( index + 1 ))
+    done
+    printf '  0) cancel\n' >&2
+    printf 'Choice: ' >&2
+
+    read -r reply || reply=''
+
+    if [[ ! "${reply}" =~ ^[0-9]+$ ]] || (( reply < 1 || reply > ${#labels[@]} ))
+    then
+        return 1
+    fi
+
+    printf '%d\n' "${reply}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::menu
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::ask <prompt> [<default>]
+#
+# Description:
+#   Reads a single value, optionally offering a default. Writes
+#   "<prompt> [<default>]: " (or "<prompt>: " when no default) to stderr and
+#   reads one line from stdin; prints the entered text to stdout, or the default
+#   when the reply is empty.
+#
+# Arguments:
+#   <prompt>   The label shown before the optional bracketed default
+#   <default>  The value used when the reply is empty (optional)
+#
+# Returns:
+#   0 always
+#
+# Example:
+#   repo="$( clone_repo::ask 'Repository (owner/repo)' )"
+#--------------------------------------------------
+clone_repo::ask() {
+    local default
+    local prompt
+    local reply
+
+    prompt="$1"
+    default="${2:-}"
+
+    if [[ -n "${default}" ]]
+    then
+        printf '%s [%s]: ' "${prompt}" "${default}" >&2
+    else
+        printf '%s: ' "${prompt}" >&2
+    fi
+    read -r reply || reply=''
+
+    [[ -n "${reply}" ]] || reply="${default}"
+
+    printf '%s\n' "${reply}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::ask
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::workspace_root
+#
+# Description:
+#   Prints the directory this script sits in, the root of the workspace tree
+#   when run from the deployed copy. Resolved from the script's own location
+#   (the canonicalised ${BASH_SOURCE[0]}), so the copy at every workspace root
+#   reports its own tree without any baked-in path. Writes the path to stdout.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   root="$( clone_repo::workspace_root )"
+#--------------------------------------------------
+clone_repo::workspace_root() {
+    local source
+
+    source="$( readlink -f -- "${BASH_SOURCE[0]}" )"
+
+    dirname -- "${source}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::workspace_root
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::workspace_name <root>
+#
+# Description:
+#   Prints the workspace display name, read from the "Workspace: <name>" line of
+#   the .workspace-managed marker at <root> (the stamp the workspace tool writes
+#   at the root of every managed tree). Leading whitespace after the label is
+#   stripped, so the two-space layout of the marker is handled. Fatal with a
+#   clear message, and a non-zero return, when the marker is missing or carries
+#   no such line. Writes the name to stdout, or the error to stderr.
+#
+# Arguments:
+#   <root>  The directory holding the .workspace-managed marker
+#
+# Returns:
+#   0 and prints the name on success
+#   1 when the marker is missing or has no Workspace line
+#
+# Example:
+#   name="$( clone_repo::workspace_name "${root}" )" || exit 1
+#--------------------------------------------------
+clone_repo::workspace_name() {
+    local line
+    local marker
+    local name
+    local root
+
+    root="$1"
+    marker="${root}/.workspace-managed"
+
+    if [[ ! -f "${marker}" ]]
+    then
+        clone_repo::fatal "no .workspace-managed marker in ${root}; this clone-repo helper must live at a workspace root"
+
+        return 1
+    fi
+
+    while IFS= read -r line || [[ -n "${line}" ]]
+    do
+        case "${line}" in
+            'Workspace:'*)
+                name="${line#Workspace:}"
+                name="${name#"${name%%[![:space:]]*}"}"   # strip leading whitespace
+
+                printf '%s\n' "${name}"
+
+                return 0
+                ;;
+        esac
+    done < "${marker}"
+
+    clone_repo::fatal "the .workspace-managed marker in ${root} names no workspace"
+
+    return 1
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::workspace_name
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::slug <name>
+#
+# Description:
+#   Prints the slug for a workspace display name: the name lower-cased, spaces
+#   turned into hyphens, and every other character outside [a-z0-9._-] stripped.
+#   A verbatim copy of workspace::slug, so the alias and fragment names computed
+#   here match the ones the workspace tool wrote under ~/.ssh/config.d. Writes
+#   the slug to stdout.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   clone_repo::slug 'Acme Corp'
+#--------------------------------------------------
+clone_repo::slug() {
+    local name
+    local slug
+
+    name="$1"
+    slug="${name,,}"                              # lower-case
+    slug="${slug// /-}"                           # spaces to hyphens
+    slug="${slug//[^a-z0-9._-]/}"                 # strip everything else
+
+    printf '%s' "${slug}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::slug
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::managed_providers <slug>
+#
+# Description:
+#   Prints the real hosts this workspace has an SSH key for, one per line, by
+#   globbing its per-identity fragments under ~/.ssh/config.d (20-<slug>-<host>)
+#   and stripping the 20-<slug>- prefix from each. Drives the interactive
+#   provider menu and the host validation. Writes the hosts to stdout, or
+#   nothing when the workspace manages none.
+#
+# Arguments:
+#   <slug>  The workspace slug that scopes its fragments
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   mapfile -t providers < <( clone_repo::managed_providers personal )
+#--------------------------------------------------
+clone_repo::managed_providers() {
+    local base
+    local file
+    local prefix
+    local slug
+
+    slug="$1"
+    prefix="20-${slug}-"
+
+    for file in "${HOME}/.ssh/config.d/${prefix}"*
+    do
+        [[ -e "${file}" ]] || continue           # the glob matched nothing
+
+        base="$( basename -- "${file}" )"
+
+        printf '%s\n' "${base#"${prefix}"}"
+    done
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::managed_providers
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::resolve_host <token> <slug>
+#
+# Description:
+#   Resolves a provider token to the real host it names. A configured alias
+#   (one ending in -<slug>) has its workspace suffix stripped back to the real
+#   host; the shorthands github, gitlab and bitbucket expand to github.com,
+#   gitlab.com and bitbucket.org; anything else is passed through unchanged as a
+#   literal host. Writes the host to stdout.
+#
+# Arguments:
+#   <token>  The provider token (a shorthand, a host, or a configured alias)
+#   <slug>   The workspace slug, used to recognise an alias suffix
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   clone_repo::resolve_host github personal
+#--------------------------------------------------
+clone_repo::resolve_host() {
+    local slug
+    local token
+
+    token="$1"
+    slug="$2"
+
+    # An already-configured alias (host-<slug>): strip the workspace suffix back
+    # to the real host the alias resolves to.
+    if [[ "${token}" == *"-${slug}" ]]
+    then
+        printf '%s\n' "${token%"-${slug}"}"
+
+        return 0
+    fi
+
+    case "${token}" in
+        github) printf 'github.com\n' ;;
+        gitlab) printf 'gitlab.com\n' ;;
+        bitbucket) printf 'bitbucket.org\n' ;;
+        *) printf '%s\n' "${token}" ;;
+    esac
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::resolve_host
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::parse_url <url>
+#
+# Description:
+#   Splits a git remote URL into its host and its owner/repo path and prints
+#   them tab-separated as "<host>\t<owner>/<repo>". Handles the HTTPS form
+#   (https://host/owner/repo), both SSH forms (git@host:owner/repo and
+#   ssh://git@host/owner/repo) and a bare host:owner/repo, stripping any scheme
+#   and userinfo first. Writes the host and path to stdout.
+#
+# Arguments:
+#   <url>  A git remote URL in any of the supported transports
+#
+# Returns:
+#   0 always
+#
+# Example:
+#   IFS=$'\t' read -r host path < <( clone_repo::parse_url 'https://github.com/o/r.git' )
+#--------------------------------------------------
+clone_repo::parse_url() {
+    local host
+    local path
+    local url
+
+    url="$1"
+
+    url="${url#*://}"
+    url="${url#*@}"
+    host="${url%%[:/]*}"
+    path="${url#"${host}"}"
+    path="${path#[:/]}"
+
+    printf '%s\t%s\n' "${host}" "${path}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::parse_url
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::repo_name <owner/repo>
+#
+# Description:
+#   Prints the repository's directory name: the last path component with any
+#   trailing .git removed (owner/repo.git -> repo). Used to name the clone
+#   destination under the workspace root. Writes the name to stdout.
+#
+# Arguments:
+#   <owner/repo>  The repository path, with or without a trailing .git
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   clone_repo::repo_name juliendufresne/machine-workspace.git
+#--------------------------------------------------
+clone_repo::repo_name() {
+    local name
+
+    name="${1##*/}"
+    name="${name%.git}"
+
+    printf '%s\n' "${name}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::repo_name
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::resolve_dest <root> <repo-name>
+#
+# Description:
+#   Resolves the clone destination, <root>/<repo-name>. When that path already
+#   exists it warns and prompts (on stderr / stdin) for a different directory
+#   name, looping until the chosen path is free. Prints the resolved path to
+#   stdout; prompts and warnings go to stderr.
+#
+# Arguments:
+#   <root>       The workspace root the clone lands under
+#   <repo-name>  The default directory name (the repository name)
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   dest="$( clone_repo::resolve_dest "${root}" machine-workspace )"
+#--------------------------------------------------
+clone_repo::resolve_dest() {
+    local dest
+    local name
+    local root
+
+    root="$1"
+    name="$2"
+
+    dest="${root}/${name}"
+    while [[ -e "${dest}" ]]
+    do
+        clone_repo::warn "${dest} already exists; choose a different directory name"
+        name="$( clone_repo::ask 'new directory name' )"
+        [[ -n "${name}" ]] || continue
+
+        dest="${root}/${name}"
+    done
+
+    printf '%s\n' "${dest}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::resolve_dest
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::clone <alias> <owner/repo> <dest>
+#
+# Description:
+#   Clones the repository through the workspace's SSH host alias, running
+#   "git clone git@<alias>:<owner>/<repo>.git <dest>". A trailing .git on the
+#   path is normalised away before the single .git is appended, so a path parsed
+#   from a URL and one typed by hand both produce the same URL. Reports progress
+#   on stdout and runs git, which clones into <dest> under the workspace root.
+#
+# Arguments:
+#   <alias>       The SSH host alias (the workspace's <host>-<slug>)
+#   <owner/repo>  The repository path, with or without a trailing .git
+#   <dest>        The directory to clone into
+#
+# Returns:
+#   0 on success
+#   the git clone exit status on failure
+#
+# Example:
+#   clone_repo::clone github.com-personal juliendufresne/machine-workspace ~/Workspace/Personal/machine-workspace
+#--------------------------------------------------
+clone_repo::clone() {
+    local alias_name
+    local dest
+    local path
+    local url
+
+    alias_name="$1"
+    path="$2"
+    dest="$3"
+
+    url="git@${alias_name}:${path%.git}.git"
+
+    clone_repo::info "cloning ${url} into ${dest}"
+    git clone -- "${url}" "${dest}"
+    clone_repo::success "cloned ${path%.git} into ${dest}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::clone
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   clone_repo::main [<url> | <provider> <owner/repo>]
+#
+# Description:
+#   Entry point. Clones a repository through the SSH identity of the workspace
+#   this script sits in. It resolves the workspace from its own location (the
+#   .workspace-managed marker beside it), then resolves the real host and the
+#   owner/repo from the arguments in one of three shapes: with none it lists the
+#   providers the workspace manages, asks which one, and asks for owner/repo;
+#   with one it parses a full clone URL (https or ssh); with two it takes a
+#   provider (or host, or alias) and an owner/repo. It then builds the
+#   workspace's host alias, refuses with an error when the workspace has no key
+#   for that host (never falling back to the default key), resolves a free
+#   destination under the workspace root, and clones. Fails up front when git is
+#   not installed. Reads on the terminal, prompts and errors on stderr, and
+#   clones under the workspace root.
+#
+# Arguments:
+#   <url>             A full clone URL (one-argument form)
+#   <provider>        A provider shorthand, host, or alias (two-argument form)
+#   <owner/repo>      The repository path (two-argument form)
+#
+# Returns:
+#   0 on success
+#   1 when git is missing, the workspace cannot be resolved, no provider is
+#     chosen, or the workspace has no key for the host
+#   2 on a usage error (too many arguments)
+#   the git clone exit status when the clone fails
+#
+# Example:
+#   clone_repo::main github juliendufresne/machine-workspace
+#--------------------------------------------------
+clone_repo::main() {
+    local alias_name
+    local choice
+    local dest
+    local fragment
+    local host
+    local name
+    local path
+    local repo
+    local root
+    local slug
+    local -a providers
+
+    clone_repo::stage 'Clone a repository'
+
+    if ! command -v git > /dev/null 2>&1
+    then
+        clone_repo::fatal 'git is not installed'
+
+        return 1
+    fi
+
+    root="$( clone_repo::workspace_root )"
+    name="$( clone_repo::workspace_name "${root}" )" || return $?
+    slug="$( clone_repo::slug "${name}" )"
+
+    case $# in
+        0)
+            mapfile -t providers < <( clone_repo::managed_providers "${slug}" )
+            if (( ${#providers[@]} == 0 ))
+            then
+                clone_repo::fatal "workspace ${name} has no SSH provider configured; add an SSH key first"
+
+                return 1
+            fi
+
+            choice="$( clone_repo::menu 'Select a provider to clone from:' "${providers[@]}" )" || {
+                clone_repo::fatal 'no provider selected'
+
+                return 1
+            }
+            host="${providers[$(( choice - 1 ))]}"
+            path="$( clone_repo::ask 'Repository (owner/repo)' )"
+            ;;
+        1)
+            IFS=$'\t' read -r host path < <( clone_repo::parse_url "$1" )
+            ;;
+        2)
+            host="$( clone_repo::resolve_host "$1" "${slug}" )"
+            path="$2"
+            ;;
+        *)
+            clone_repo::fatal 'usage: clone-repo [<url> | <provider> <owner/repo>]'
+
+            return 2
+            ;;
+    esac
+
+    if [[ -z "${path}" ]]
+    then
+        clone_repo::fatal 'no repository given'
+
+        return 1
+    fi
+
+    alias_name="${host}-${slug}"
+    fragment="${HOME}/.ssh/config.d/20-${slug}-${host}"
+    if [[ ! -f "${fragment}" ]]
+    then
+        clone_repo::fatal "workspace ${name} has no SSH key for ${host}"
+
+        return 1
+    fi
+
+    repo="$( clone_repo::repo_name "${path}" )"
+    dest="$( clone_repo::resolve_dest "${root}" "${repo}" )"
+
+    clone_repo::clone "${alias_name}" "${path}" "${dest}"
+}
+[[ -v TEST_FLAG ]] || readonly -f clone_repo::main
+
+# ─── Execute ──────────────────────────────────────────────────────────────────
+
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || clone_repo::main "$@"
