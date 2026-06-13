@@ -152,3 +152,68 @@ without changes. To run unattended, pass a `[name]`: every prompt then resolves 
 its seeded default from the registry (and an empty passphrase), so a workspace
 defined in a previous run is reprovisioned without questions.
 
+## What it writes
+
+Everything lands under `$HOME`:
+
+- `~/.gitconfig` - a reversible `# >>> workspace gitconfig <slug> >>>` ... `# <<<`
+  IncludeIf block per workspace, pointing repositories under the tree at the
+  workspace's own `.gitconfig`.
+- `<workspace>/.gitconfig` - the per-tree git identity (name, email, signing key,
+  signing on).
+- `<workspace>/clone-repo` - a managed helper that clones a repository through the
+  workspace's SSH identity. It is rewritten on every run (a local edit is lost), and
+  appears once the workspace has at least one SSH key.
+- `~/.ssh/config` - a marked `Include config.d/*` line, prepended once.
+- `~/.ssh/config.d/` - the base fragments (`00-base`, and `10-macos` on macOS) and
+  one `20-<slug>-<host>` fragment per host alias.
+- `~/.ssh/id_<keyname>` and `~/.ssh/id_<keyname>.pub` - the generated SSH keys.
+- The GPG signing keys, in your GPG keyring.
+- `$XDG_STATE_HOME/workspace` (default `~/.local/state/workspace`) - the registry
+  of workspace definitions and the ownership manifests used for a safe uninstall.
+
+The tool runs no package manager and never asks for sudo.
+
+## How it is laid out
+
+```
+bin/workspace             the entrypoint: validate the verb and exec libexec/create / remove / show
+bin/enable-push           standalone: point the current repo at an existing SSH host alias and GPG key
+install.sh                POSIX-sh bootstrap: clone or fast-forward, then run bin/workspace
+libexec/create            the create action: define and provision each tree inline
+libexec/remove            the remove action: reverse the marked blocks and forget the workspace
+libexec/show              the show action: the read-only per-workspace report
+libexec/manage-ssh-keys   the SSH key flow: per-workspace key management (used by create) or a standalone key
+libexec/clone-repo        the managed clone-repo helper: clone through a workspace's SSH identity (copied to each workspace root)
+lib/workspace.sh          the shared workspace primitives: slug, list, exists, path, email, hosts
+lib/clone_script.sh       deploys the managed clone-repo helper to a workspace root
+lib/ssh_key.sh            the SSH key primitives: generate, load into the agent, read back, remove
+lib/ssh_config.sh         the ~/.ssh/config.d host-alias fragments
+lib/ssh_connect.sh        the provider auth probe and the SSH registration gate
+lib/gpg.sh                GPG signing-key generation and registration
+lib/gitconfig.sh          the reversible ~/.gitconfig IncludeIf blocks
+lib/output.sh             logging, stage headers, and the spinner
+lib/prompt.sh             single-value, single-select, and checkbox prompts
+lib/state.sh              the state store and ownership manifests
+dev/                      everything used only to develop the tool
+```
+
+For the coding conventions, see the docs under [`dev/docs/`](dev/docs/):
+
+- [shell-style.md](dev/docs/shell-style.md) and
+  [shellspec-style.md](dev/docs/shellspec-style.md) - the shell and shellspec
+  style guides.
+
+## Development
+
+The checks run in a pinned docker toolbox through the `Makefile`:
+
+```sh
+make lint     # shellcheck every script
+make test     # run the shellspec suite
+make check    # both
+```
+
+The only prerequisite is docker. To run the tools directly instead, install
+shellcheck and [shellspec](https://shellspec.info) and run `shellspec` and
+`shellcheck --rcfile dev/.shellcheckrc <scripts>` from the repo root.
