@@ -1,0 +1,110 @@
+name: CI
+
+# Lint and test through the same pinned dev toolbox image used locally, so CI
+# and local runs are identical (see the Makefile and
+# dev/docker/dev-tools/Dockerfile).
+#
+# The image is built once in the build-image job and shared with the dependent
+# jobs through the Actions cache, so it is built at most once per run instead of
+# once per job. The cache is the single source of truth: build-image guarantees
+# the tarball is in the cache (restoring it on a hit, building and saving it on a
+# miss) before its dependents start, and they restore it from that same cache.
+# Caching across runs also means an unchanged Dockerfile skips the build
+# entirely.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-image:
+    name: build image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # https://github.com/actions/checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # A cache hit restores the saved image tarball and skips the build step
+      # below. The key tracks the inputs that change what gets built - the
+      # Dockerfile and the tracked .env (which carries the version build-args) -
+      # so a rebuild happens only when those actually change.
+      - name: Cache dev toolbox image
+        id: image-cache
+        # https://github.com/actions/cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: var/dev-tools-image.tar.gz
+          key: dev-tools-image-${{ runner.os }}-${{ hashFiles('dev/docker/dev-tools/Dockerfile', '.env') }}
+
+      # On a miss the cache step above saves this tarball in its post-job step,
+      # making it available to the dependent jobs. The saved image name must
+      # match the Makefile's DEV_TOOL_IMAGE.
+      - name: Build and save dev toolbox image
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          make tools-build
+          mkdir -p var
+          docker save workspace-dev-tools | gzip > var/dev-tools-image.tar.gz
+
+  lint:
+    name: lint
+    needs: build-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # https://github.com/actions/checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Restore the image the build-image job left in the cache. The key must
+      # match the one in build-image; fail-on-cache-miss turns a missing entry
+      # into a clear error instead of a confusing docker load failure below.
+      - name: Restore dev toolbox image
+        # https://github.com/actions/cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: var/dev-tools-image.tar.gz
+          key: dev-tools-image-${{ runner.os }}-${{ hashFiles('dev/docker/dev-tools/Dockerfile', '.env') }}
+          fail-on-cache-miss: true
+
+      # Load the prebuilt image so the make targets find it via tools-ensure
+      # (which keys off `docker image inspect`) and skip rebuilding.
+      - name: Load dev toolbox image
+        run: gunzip -c var/dev-tools-image.tar.gz | docker load
+
+      - name: Lint shell scripts
+        run: make lint-shell
+
+      - name: Lint GitHub workflows
+        run: make lint-github-workflows
+
+  test:
+    name: test
+    needs: build-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # https://github.com/actions/checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Restore dev toolbox image
+        # https://github.com/actions/cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: var/dev-tools-image.tar.gz
+          key: dev-tools-image-${{ runner.os }}-${{ hashFiles('dev/docker/dev-tools/Dockerfile', '.env') }}
+          fail-on-cache-miss: true
+
+      - name: Load dev toolbox image
+        run: gunzip -c var/dev-tools-image.tar.gz | docker load
+
+      - name: Run shell tests
+        run: make test
