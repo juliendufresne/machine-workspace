@@ -1,0 +1,996 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# The manage-ssh-keys helper: manage a workspace's SSH keys, or create a standalone
+# key outside any workspace. With a workspace name it drives that workspace's SSH key
+# management menu (the same flow the create action runs inline). With no name it asks
+# which registered workspace the keys are for, or offers to create a key outside any
+# workspace - a standalone key that is generated (with an optional ~/.ssh/config Host
+# block) but recorded in no registry, so the tool will not track, edit or remove it
+# afterward. It is sourced by libexec/create, which calls manage_ssh_keys::menu <name>
+# for the workspace it is provisioning so the menu never re-asks which workspace; it is
+# not a bin/workspace verb, but it is executable, so it can be run directly to create
+# SSH keys on its own (manage_ssh_keys::main). The per-workspace flow records what each
+# key serves under workspace.<slug>.ssh.* and writes the keys and ~/.ssh/config.d blocks
+# under $HOME; the standalone flow writes only the key and an optional Host block. The
+# shared registry/query primitives live in lib/workspace.sh and the key/config
+# primitives in lib/ssh_key.sh and lib/ssh_config.sh.
+
+# ─── Functions ────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::key_entries <name>
+#
+# Description:
+#   Prints the workspace's created SSH keys, one tab-separated '<keyname>\t<description>'
+#   per unique key, the shared backing for the key listing (manage_ssh_keys::list), the
+#   key count (manage_ssh_keys::keys) and the removal picker (manage_ssh_keys::pick_remove).
+#   A key is listed once even when it serves several providers: each provider host of
+#   workspace::ssh::hosts is folded onto the key it maps to
+#   (workspace.<slug>.ssh.host.<host>.key, defaulting to the slug), in first-seen order,
+#   with the description "for <h1>, <h2>"; then each host-less extra key
+#   (workspace.<slug>.ssh.extra_keys) is appended with the description "(no provider)".
+#   Reads the registry only; writes the entries to stdout.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   mapfile -t entries < <(manage_ssh_keys::key_entries Personal)
+#--------------------------------------------------
+manage_ssh_keys::key_entries() {
+    local host
+    local -A key_providers
+    local keyname
+    local name
+    local -a order
+    local raw
+    local -A seen
+    local slug
+
+    name="$1"
+    slug="$(workspace::slug "$name")"
+    key_providers=()
+    order=()
+    seen=()
+
+    # Fold each provider host onto the key it serves, collecting keys in first-seen
+    # order so a key shared across providers is listed once with every provider.
+    while IFS= read -r host
+    do
+        [[ -n "$host" ]] || continue
+
+        keyname="$(state::input "workspace.$slug.ssh.host.$host.key" 2>/dev/null || true)"
+        [[ -n "$keyname" ]] || keyname="$slug"
+
+        if [[ -z "${seen[$keyname]:-}" ]]
+        then
+            seen["$keyname"]=1
+            order+=("$keyname")
+            key_providers["$keyname"]=''
+        fi
+
+        if [[ -n "${key_providers[$keyname]}" ]]
+        then
+            key_providers["$keyname"]+=", $host"
+        else
+            key_providers["$keyname"]="$host"
+        fi
+    done < <(workspace::ssh::hosts "$name")
+
+    # Then each host-less extra key, one not already seen as a provider key.
+    raw="$(state::input "workspace.$slug.ssh.extra_keys" 2>/dev/null || true)"
+    while IFS= read -r keyname
+    do
+        [[ -n "$keyname" ]] || continue
+        [[ -z "${seen[$keyname]:-}" ]] || continue
+
+        seen["$keyname"]=1
+        order+=("$keyname")
+        key_providers["$keyname"]=''
+    done <<<"$raw"
+
+    for keyname in "${order[@]}"
+    do
+        if [[ -n "${key_providers[$keyname]}" ]]
+        then
+            printf '%s\tfor %s\n' "$keyname" "${key_providers[$keyname]}"
+        else
+            printf '%s\t(no provider)\n' "$keyname"
+        fi
+    done
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::key_entries
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::list <name>
+#
+# Description:
+#   Shows the SSH key management title and lists the workspace's created keys for
+#   review at the top of the management menu (manage_ssh_keys::menu): an output::group
+#   heading "ssh key management", then one info line per unique key as "ssh key <keyname>
+#   <description>" (the key with its providers, or "(no provider)" for a host-less extra
+#   key), drawn from manage_ssh_keys::key_entries. With no keys created yet it says so.
+#   Reads the registry only; writes the lines to stdout.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   manage_ssh_keys::list Personal
+#--------------------------------------------------
+manage_ssh_keys::list() {
+    local -i any
+    local desc
+    local keyname
+    local name
+
+    name="$1"
+    any=0
+
+    output::group 'ssh key management'
+
+    while IFS=$'\t' read -r keyname desc
+    do
+        [[ -n "$keyname" ]] || continue
+        any=1
+
+        output::info "ssh key $keyname $desc"
+    done < <(manage_ssh_keys::key_entries "$name")
+
+    ((any)) || output::info 'no SSH keys created yet'
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::list
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::keys <name>
+#
+# Description:
+#   Prints the names of the workspace's created SSH keys, one per line and once each,
+#   the keyname column of manage_ssh_keys::key_entries. The driver (manage_ssh_keys::menu)
+#   counts these to decide which management options to offer (the "create one key for
+#   all" option drops once two keys exist and becomes a reuse once one does) and reads
+#   the single key's name back when reusing it. Reads the registry only; writes the
+#   names to stdout.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   mapfile -t keys < <(manage_ssh_keys::keys Personal)
+#--------------------------------------------------
+manage_ssh_keys::keys() {
+    local desc
+    local keyname
+
+    while IFS=$'\t' read -r keyname desc
+    do
+        [[ -n "$keyname" ]] || continue
+
+        printf '%s\n' "$keyname"
+    done < <(manage_ssh_keys::key_entries "$1")
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::keys
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::pick_remove <name>
+#
+# Description:
+#   Drives the single-select list of the workspace's created keys so the user can pick
+#   one to remove (manage_ssh_keys::menu's remove path). Each created key
+#   (manage_ssh_keys::key_entries) is offered as "<keyname> <description>", the value
+#   being the key name. With no keys created it cancels (status 2) without prompting, so
+#   the caller falls back to the menu. A lone Escape cancels too. Prints the chosen key
+#   name to stdout. Drives the list on the terminal through prompt::select_one.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 when a key was chosen (printed to stdout)
+#   2 when the user cancelled or no keys exist
+#
+# Example:
+#   keyname="$(manage_ssh_keys::pick_remove Personal)" || continue
+#--------------------------------------------------
+manage_ssh_keys::pick_remove() {
+    local desc
+    local -a entries
+    local keyname
+    local name
+
+    name="$1"
+
+    entries=()
+    while IFS=$'\t' read -r keyname desc
+    do
+        [[ -n "$keyname" ]] || continue
+
+        entries+=("$(printf '%s\t%s %s' "$keyname" "$keyname" "$desc")")
+    done < <(manage_ssh_keys::key_entries "$name")
+
+    ((${#entries[@]} > 0)) || return 2             # nothing to remove
+
+    PROMPT_HELP='Removing a key deletes its key files and ~/.ssh/config blocks; its public half may still be registered with a provider.' \
+        prompt::select_one 'pick the SSH key to remove' "${entries[@]}"
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::pick_remove
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::remove_key <name> <keyname>
+#
+# Description:
+#   Removes one created SSH key, the reverse of manage_ssh_keys::create. For each
+#   provider host the key serves (workspace::ssh::hosts whose host->key mapping is
+#   <keyname>) it removes the host's ~/.ssh/config block (ssh_config::host::remove),
+#   drops the host->key mapping (workspace.<slug>.ssh.host.<host>.key) and the host from
+#   the workspace's provider list (workspace.<slug>.providers). It then drops the key
+#   from the host-less extra-key list (a no-op for a provider key), clears the key's
+#   recorded settings (workspace.<slug>.ssh.key.<keyname>.*) and removes the key files
+#   (ssh_key::remove). Edits the shared ~/.ssh config, clears the registry inputs and
+#   removes the key files under $HOME.
+#
+# Arguments:
+#   <name>     The workspace display name
+#   <keyname>  The name of the key to remove
+#
+# Returns:
+#   0 on success
+#   the failing step's exit status when a removal fails
+#
+# Example:
+#   manage_ssh_keys::remove_key Personal github.com-personal
+#--------------------------------------------------
+manage_ssh_keys::remove_key() {
+    local host
+    local keyname
+    local mapped
+    local name
+    local slug
+
+    name="$1"
+    keyname="$2"
+    slug="$(workspace::slug "$name")"
+
+    # Each provider host this key serves: drop its config block, its host->key mapping
+    # and the host from the provider list. The host stream is captured before the loop
+    # body edits the registry, so editing the provider list mid-loop is safe.
+    while IFS= read -r host
+    do
+        [[ -n "$host" ]] || continue
+
+        mapped="$(state::input "workspace.$slug.ssh.host.$host.key" 2>/dev/null || true)"
+        [[ -n "$mapped" ]] || mapped="$slug"
+        [[ "$mapped" == "$keyname" ]] || continue
+
+        ssh_config::host::remove "$host" "$slug" || return $?
+        state::unset "workspace.$slug.ssh.host.$host.key"
+        state::commit_line_remove "workspace.$slug.providers" "$host"
+    done < <(workspace::ssh::hosts "$name")
+
+    # A host-less extra key: drop it from the extra-key list (a no-op for a provider key).
+    state::commit_line_remove "workspace.$slug.ssh.extra_keys" "$keyname"
+
+    # The key's recorded settings, then the key files themselves.
+    state::unset_prefix "workspace.$slug.ssh.key.$keyname."
+    ssh_key::remove "$keyname" || return $?
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::remove_key
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::remaining_providers <name>
+#
+# Description:
+#   Prints the known providers a new key could still serve, one per line: github.com,
+#   gitlab.com and bitbucket.org in that order, less the ones the workspace already
+#   manages (workspace::ssh::hosts), so the creation checklist only ever offers a
+#   provider that is not yet wired to a key. Reads the registry only; writes the hosts
+#   to stdout, or nothing when every provider is already managed.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   mapfile -t providers < <(manage_ssh_keys::remaining_providers Personal)
+#--------------------------------------------------
+manage_ssh_keys::remaining_providers() {
+    local host
+    local name
+    local -A seen
+
+    name="$1"
+    seen=()
+
+    while IFS= read -r host
+    do
+        [[ -n "$host" ]] || continue
+        seen["$host"]=1
+    done < <(workspace::ssh::hosts "$name")
+
+    for host in github.com gitlab.com bitbucket.org
+    do
+        [[ -z "${seen[$host]:-}" ]] || continue
+
+        printf '%s\n' "$host"
+    done
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::remaining_providers
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::pick_providers <name> <allow_custom>
+#
+# Description:
+#   Drives the SSH target checklist for one round of key creation: the providers the
+#   workspace does not yet manage (manage_ssh_keys::remaining_providers), each shown with
+#   its human-readable label (github.com -> GitHub, and so on) from an inline map, all
+#   left unselected so the user opts in to exactly the targets a key should serve. When
+#   <allow_custom> is yes a host-less "custom" item is appended too, so the per-provider
+#   path can offer extra keys alongside the providers; the "one key for all" path passes
+#   no, since it creates a single shared key with no extra keys. With nothing to offer
+#   (every provider managed and custom not allowed) it prints nothing without prompting.
+#   Prints the selected tokens (a provider host, or the literal "custom"), one per line,
+#   to stdout. Drives the checklist on the terminal through prompt::select_multi.
+#
+# Arguments:
+#   <name>          The workspace display name
+#   <allow_custom>  yes to append the host-less custom item, anything else to omit it
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   mapfile -t picks < <(manage_ssh_keys::pick_providers Personal yes)
+#--------------------------------------------------
+manage_ssh_keys::pick_providers() {
+    local allow_custom
+    local -a entries
+    local host
+    local -A labels
+    local name
+
+    name="$1"
+    allow_custom="$2"
+
+    labels=(
+        [github.com]=GitHub
+        [gitlab.com]=GitLab
+        [bitbucket.org]=Bitbucket
+    )
+    entries=()
+    while IFS= read -r host
+    do
+        [[ -n "$host" ]] || continue
+
+        entries+=("$(printf '0\t%s\t%s' "$host" "${labels[$host]:-$host}")")
+    done < <(manage_ssh_keys::remaining_providers "$name")
+
+    if [[ "$allow_custom" == yes ]]
+    then
+        entries+=("$(printf '0\tcustom\t%s' 'custom keys (no Host config will be created)')")
+    fi
+
+    ((${#entries[@]} > 0)) || return 0             # nothing left to offer
+
+    prompt::select_multi 'Select what this SSH key is for. Arrows or j/k move, space toggles, Enter confirms.' \
+        "${entries[@]}"
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::pick_providers
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::create <name> <default_keyname> [<host>...]
+#
+# Description:
+#   Collects one SSH key's settings from the user, records what the key is and what it
+#   serves, then provisions it. It asks for
+#   the key name (default <default_keyname>), the type (ed25519 or rsa, and an RSA
+#   length), and a comment (default the workspace's email), and persists them under
+#   workspace.<slug>.ssh.key.<keyname>.*. Each given <host> is a known provider: the
+#   host is pointed at the key (workspace.<slug>.ssh.host.<host>.key) and added to the
+#   workspace's provider list (state::list_append), so the host appears in
+#   workspace::ssh::hosts; with no hosts the key is a host-less extra key, appended to
+#   workspace.<slug>.ssh.extra_keys instead. It then prompts for the passphrase with a
+#   hidden prompt (prompt::ask_secret) only when the key file does not yet exist
+#   (resolved through ssh_key::path), since an existing key is reused rather than
+#   regenerated. It then provisions the key: it generates the key file (ssh_key::generate
+#   in lib/ssh_key.sh, idempotent so an existing key is reused), loads it into the
+#   ssh-agent when one is running (SSH_AUTH_SOCK, ssh_key::register), and for each
+#   provider <host> writes the host's ~/.ssh/config.d block when absent
+#   (ssh_config::host::add, with the slug-namespaced alias from ssh_config::host::alias,
+#   login user git) and, with an agent, shows the key for registration
+#   (ssh_connect::register; a skip is the user's choice, not a failure). ssh_key::generate
+#   is UI-free, so the spinner (output::run) and this wiring live here. The passphrase is
+#   kept in a local variable and never stored. A lone Escape in any settings prompt
+#   cancels before anything is recorded or generated. Reads on the terminal, writes the
+#   workspace inputs, and writes the key and its config under $HOME.
+#
+# Arguments:
+#   <name>             The workspace display name
+#   <default_keyname>  The default key name offered in the prompt
+#   <host>...          Zero or more known provider hosts the key serves
+#
+# Returns:
+#   0 on success
+#   2 when the user cancelled
+#   the failing step's exit status when provisioning fails
+#
+# Example:
+#   manage_ssh_keys::create Personal personal github.com
+#--------------------------------------------------
+manage_ssh_keys::create() {
+    local alias_name
+    local bits
+    local comment
+    local default_keyname
+    local email
+    local fragment
+    local host
+    local -a hosts
+    local keyfile
+    local keyname
+    local name
+    local passphrase
+    local purpose
+    local slug
+    local type
+
+    name="$1"
+    default_keyname="$2"
+    shift 2
+    hosts=("$@")
+    slug="$(workspace::slug "$name")"
+    email="$(workspace::git::user_email "$name")"
+
+    # What this key is for, so the name prompt names the provider(s) it serves rather
+    # than asking about an unnamed "this" key. A host-less key is a custom one.
+    if ((${#hosts[@]} > 0))
+    then
+        purpose="for $(IFS=', '; printf '%s' "${hosts[*]}")"   # subshell IFS, so it does not leak
+    else
+        purpose='for custom use (no provider)'
+    fi
+
+    # Collect the key's settings from the user.
+    keyname="$(PROMPT_HELP="The filename for the SSH key $purpose, under ~/.ssh." prompt::ask "SSH key name $purpose" "$default_keyname")" || return $?
+    [[ -n "$keyname" ]] || keyname="$default_keyname"
+
+    type="$(PROMPT_HELP='The SSH key algorithm; ed25519 is recommended.' prompt::select_one 'SSH key type' \
+        "$(printf 'ed25519\ted25519 (recommended)')" \
+        "$(printf 'rsa\trsa')")" || return $?
+
+    bits=''
+    if [[ "$type" == rsa ]]
+    then
+        bits="$(PROMPT_HELP='The RSA key length in bits; longer is stronger but slower.' prompt::select_one 'RSA key length' \
+            "$(printf '2048\t2048')" \
+            "$(printf '4096\t4096')")" || return $?
+    fi
+
+    comment="$(PROMPT_HELP="A label stored in the SSH key's comment field." prompt::ask "SSH key comment for $keyname" "$email")" || return $?
+
+    # Record the key's settings and what it serves.
+    state::set "workspace.$slug.ssh.key.$keyname.type" "$type"
+    state::set "workspace.$slug.ssh.key.$keyname.rsa.bits" "$bits"
+    state::set "workspace.$slug.ssh.key.$keyname.comment" "$comment"
+
+    if ((${#hosts[@]} == 0))
+    then
+        state::list_append "workspace.$slug.ssh.extra_keys" "$keyname"
+    else
+        for host in "${hosts[@]}"
+        do
+            state::set "workspace.$slug.ssh.host.$host.key" "$keyname"
+            state::list_append "workspace.$slug.providers" "$host"
+        done
+    fi
+
+    # Ask for the passphrase only when the key file does not yet exist; an existing
+    # key is reused, never regenerated.
+    keyfile="$(ssh_key::path "$keyname")"
+    passphrase=''
+    [[ -f "$keyfile" ]] || passphrase="$(prompt::ask_secret "SSH key passphrase for $keyname")"
+
+    # Provision the key. ssh_key::generate is UI-free, so the spinner and the wiring
+    # around it live here: generate the key file (idempotent, so an existing key is
+    # reused), load it into the agent when one is running, then for each provider write
+    # its ~/.ssh/config.d block when absent and show the key for registration.
+    output::run "Generating the SSH key $keyname for $name" ssh_key::generate "$keyname" "$type" "$bits" "$comment" "$passphrase" || return $?
+
+    if [[ -n "${SSH_AUTH_SOCK:-}" ]]
+    then
+        output::run "Loading $keyname into the SSH agent" ssh_key::register "$keyfile" "$passphrase" || return $?
+    fi
+
+    for host in "${hosts[@]}"
+    do
+        alias_name="$(ssh_config::host::alias "$host" "$slug")"
+        fragment="$(ssh_config::host::filename "$host" "$slug")"
+
+        if ! ssh_config::host::exist "$fragment"
+        then
+            output::run "Adding the SSH config for $alias_name" ssh_config::host::add "$fragment" "$alias_name" "$host" git "$keyfile" || return $?
+        fi
+
+        [[ -n "${SSH_AUTH_SOCK:-}" ]] || continue
+        ssh_connect::register "$alias_name" "$host" "$keyfile" || true   # a skip is the user's choice, not a failure
+    done
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::create
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::install_clone_script <name>
+#
+# Description:
+#   Deploys the managed clone-repo helper to the workspace root once the workspace
+#   has at least one SSH key. It counts the workspace's created keys
+#   (manage_ssh_keys::keys) and, when one or more exist, installs the helper
+#   (clone_script::install) at the workspace's path (workspace::path); with no keys
+#   it is a no-op, since a workspace with no SSH identity has nothing to clone
+#   through. Called at the end of manage_ssh_keys::menu so the helper appears as
+#   soon as a key exists and is rewritten on every run. Writes the helper at the
+#   workspace root under $HOME.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success (including the no-op when the workspace has no key)
+#   the failing step's exit status when the install fails
+#
+# Example:
+#   manage_ssh_keys::install_clone_script Personal
+#--------------------------------------------------
+manage_ssh_keys::install_clone_script() {
+    local -a keys
+    local -i n
+    local name
+
+    name="$1"
+
+    mapfile -t keys < <(manage_ssh_keys::keys "$name")
+    n=${#keys[@]}
+
+    ((n >= 1)) || return 0
+
+    clone_script::install "$name" "$(workspace::path "$name")" || return $?
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::install_clone_script
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::menu <name>
+#
+# Description:
+#   Drives a workspace's SSH key management menu. Each round lists the created keys with
+#   their providers (manage_ssh_keys::list), then offers, from the current key count:
+#   "create one key for all providers" (dropped once two keys exist, shown as "reuse the
+#   key for more providers" once one exists), "create one key per provider and optional
+#   custom keys", "remove an SSH key" (only with a key to remove), and "do not manage SSH
+#   keys". Removing a key (manage_ssh_keys::pick_remove, manage_ssh_keys::remove_key)
+#   redraws the menu; the other paths run the provider checklist
+#   (manage_ssh_keys::pick_providers) and create the keys, then leave. The "all" path
+#   makes one shared key for the selected providers, reusing the single existing key's
+#   name when reusing; the "per" path makes one key per selected provider and, when the
+#   custom item is checked, loops a suffix prompt (blank to stop) for host-less extra keys
+#   (manage_ssh_keys::create). Existing keys are never edited. Before it leaves, it deploys
+#   the managed clone-repo helper to the workspace root when the workspace has at least one
+#   SSH key (manage_ssh_keys::install_clone_script). A lone Escape on the menu
+#   leaves. Reads on the terminal, edits the shared config, and writes the keys and
+#   registry under $HOME.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#   the failing step's exit status when provisioning fails
+#
+# Example:
+#   manage_ssh_keys::menu Personal
+#--------------------------------------------------
+manage_ssh_keys::menu() {
+    local choice
+    local default_keyname
+    local -a entries
+    local extra
+    local host
+    local keyname
+    local -a keys
+    local -i n
+    local name
+    local -a picks
+    local -a providers
+    local slug
+    local suffix
+
+    name="$1"
+    slug="$(workspace::slug "$name")"
+
+    while true
+    do
+        manage_ssh_keys::list "$name"
+
+        mapfile -t keys < <(manage_ssh_keys::keys "$name")
+        n=${#keys[@]}
+
+        # Build the management menu from the current key count: the "all" option is a
+        # fresh shared key with no key yet, a reuse with exactly one, and gone once two
+        # exist; removal needs a key to remove.
+        entries=()
+        if ((n == 0))
+        then
+            entries+=("$(printf 'all\tcreate one SSH key for all providers')")
+        elif ((n == 1))
+        then
+            entries+=("$(printf 'all\treuse the SSH key for more providers')")
+        fi
+        entries+=("$(printf 'per\tcreate one SSH key per provider and optional custom keys')")
+        ((n == 0)) || entries+=("$(printf 'remove\tremove an SSH key')")
+        entries+=("$(printf 'quit\tdo not manage SSH keys')")
+
+        choice="$(PROMPT_HELP='Existing keys are left as is; create new keys, reuse the key for more providers, or remove one.' prompt::select_one 'choose an action' "${entries[@]}")" || break
+
+        case "$choice" in
+            quit)
+                break
+                ;;
+            remove)
+                keyname="$(manage_ssh_keys::pick_remove "$name")" || continue
+                manage_ssh_keys::remove_key "$name" "$keyname" || return $?
+
+                continue
+                ;;
+            all)
+                # One shared key for the selected providers; no custom keys here.
+                mapfile -t picks < <(manage_ssh_keys::pick_providers "$name" no)
+                providers=()
+                for host in "${picks[@]}"
+                do
+                    [[ -n "$host" ]] || continue
+                    providers+=("$host")
+                done
+                ((${#providers[@]} > 0)) || continue   # nothing selected; back to the menu
+
+                # Reuse the single existing key's name, otherwise a fresh slug-named key.
+                if ((n == 1))
+                then
+                    default_keyname="${keys[0]}"
+                else
+                    default_keyname="$slug"
+                fi
+                manage_ssh_keys::create "$name" "$default_keyname" "${providers[@]}" || return $?
+
+                break
+                ;;
+            per)
+                # One key per selected provider, plus optional host-less custom keys.
+                mapfile -t picks < <(manage_ssh_keys::pick_providers "$name" yes)
+                providers=()
+                extra=''
+                for host in "${picks[@]}"
+                do
+                    [[ -n "$host" ]] || continue
+                    if [[ "$host" == custom ]]
+                    then
+                        extra=1
+                    else
+                        providers+=("$host")
+                    fi
+                done
+                ((${#providers[@]} > 0)) || [[ -n "$extra" ]] || continue   # nothing selected
+
+                # The default key name is <slug>-<provider>, with the provider's TLD
+                # dropped (github.com -> github), e.g. personal-github.
+                for host in "${providers[@]}"
+                do
+                    manage_ssh_keys::create "$name" "$slug-${host%%.*}" "$host" || return $?
+                done
+
+                # The custom keys: a suffix names each as <suffix>-<slug>; blank stops.
+                if [[ -n "$extra" ]]
+                then
+                    while true
+                    do
+                        suffix="$(PROMPT_HELP='Names a host-less custom SSH key as <suffix>-<slug>; leave blank to stop.' prompt::ask 'custom SSH key suffix (blank to stop)')" || break
+                        [[ -n "$suffix" ]] || break
+                        manage_ssh_keys::create "$name" "$suffix-$slug" || return $?
+                    done
+                fi
+
+                break
+                ;;
+        esac
+    done
+
+    # Drop the managed clone-repo helper at the workspace root once the workspace
+    # has at least one SSH key; a no-op when none was created.
+    manage_ssh_keys::install_clone_script "$name" || return $?
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::menu
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::ask_target
+#
+# Description:
+#   Asks, with no workspace named, what the SSH keys are for: a single-select list of
+#   every registered workspace (workspace::list), each value-tagged "workspace:<name>",
+#   plus a final "external" item for creating a key outside any workspace. Prints the
+#   chosen token to stdout - "workspace:<name>" for a workspace, or "external" - so the
+#   caller (manage_ssh_keys::main) routes to the per-workspace menu or the standalone
+#   flow. With no workspace registered only the external item is offered. A lone Escape
+#   cancels (status 2). Drives the list on the terminal through prompt::select_one.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 when a target was chosen (printed to stdout)
+#   2 when the user cancelled
+#
+# Example:
+#   target="$(manage_ssh_keys::ask_target)" || return $?
+#--------------------------------------------------
+manage_ssh_keys::ask_target() {
+    local -a entries
+    local name
+
+    entries=()
+    while IFS= read -r name
+    do
+        [[ -n "$name" ]] || continue
+
+        entries+=("$(printf 'workspace:%s\t%s' "$name" "$name")")
+    done < <(workspace::list)
+    entries+=("$(printf 'external\tcreate an SSH key outside any workspace (not managed afterward)')")
+
+    PROMPT_HELP='Pick a workspace to manage its SSH keys, or create a standalone key the tool will not track.' \
+        prompt::select_one 'Which workspace are the SSH keys for?' "${entries[@]}"
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::ask_target
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::external
+#
+# Description:
+#   Creates one SSH key outside any workspace, recorded in no registry, so the tool will
+#   not track, edit or remove it afterward. It asks for the key name (looped until
+#   non-empty), the type (ed25519 or rsa, and an RSA length), a comment, and which host -
+#   if any - to write a ~/.ssh/config Host block for (none, a known provider, or a custom
+#   host), and for a host the login user (default git). It prompts for the passphrase
+#   with a hidden prompt (prompt::ask_secret) only when the key file does not yet exist
+#   (resolved through ssh_key::path), then generates the key (ssh_key::generate, idempotent
+#   so an existing key is reused) and loads it into the ssh-agent when one is running
+#   (SSH_AUTH_SOCK, ssh_key::register). When a host was chosen it writes the host's
+#   ~/.ssh/config.d block when absent (ssh_config::host::add, with the keyname-namespaced
+#   alias from ssh_config::host::alias) and, with an agent, shows the key for registration
+#   (ssh_connect::register; a skip is the user's choice, not a failure). No workspace
+#   inputs are written: the block and key are untracked, so a closing notice tells the
+#   user to manage and remove them by hand. The passphrase is kept in a local variable
+#   and never stored. A lone Escape in any settings prompt cancels before anything is
+#   generated. Reads on the terminal, warns on stderr, and writes the key and its
+#   optional config under $HOME.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 on success
+#   2 when the user cancelled
+#   the failing step's exit status when provisioning fails
+#
+# Example:
+#   manage_ssh_keys::external
+#--------------------------------------------------
+manage_ssh_keys::external() {
+    local alias_name
+    local bits
+    local comment
+    local fragment
+    local host
+    local keyfile
+    local keyname
+    local login_user
+    local passphrase
+    local type
+
+    # The key name, looped until non-empty: a host-less name under ~/.ssh.
+    while true
+    do
+        keyname="$(PROMPT_HELP='The filename for the standalone SSH key, stored under ~/.ssh as id_<name>.' prompt::ask 'SSH key name')" || return $?
+        [[ -z "$keyname" ]] || break
+
+        output::warn 'a key name is required'
+    done
+
+    type="$(PROMPT_HELP='The SSH key algorithm; ed25519 is recommended.' prompt::select_one 'SSH key type' \
+        "$(printf 'ed25519\ted25519 (recommended)')" \
+        "$(printf 'rsa\trsa')")" || return $?
+
+    bits=''
+    if [[ "$type" == rsa ]]
+    then
+        bits="$(PROMPT_HELP='The RSA key length in bits; longer is stronger but slower.' prompt::select_one 'RSA key length' \
+            "$(printf '2048\t2048')" \
+            "$(printf '4096\t4096')")" || return $?
+    fi
+
+    comment="$(PROMPT_HELP="A label stored in the SSH key's comment field." prompt::ask "SSH key comment for $keyname")" || return $?
+
+    # Optionally write a Host block so the key can be cloned through an alias. Without
+    # any state the block is untracked, so the user removes it by hand later.
+    host="$(PROMPT_HELP='A ~/.ssh/config Host block lets you clone through <host>-<name>; it is untracked, so remove it by hand later.' prompt::select_one 'create a Host config block?' \
+        "$(printf 'none\tno Host block')" \
+        "$(printf 'github.com\tGitHub')" \
+        "$(printf 'gitlab.com\tGitLab')" \
+        "$(printf 'bitbucket.org\tBitbucket')" \
+        "$(printf 'custom\ta custom host')")" || return $?
+
+    if [[ "$host" == custom ]]
+    then
+        host="$(PROMPT_HELP='The real host the alias resolves to, e.g. git.example.com.' prompt::ask 'custom host')" || return $?
+    fi
+
+    login_user=''
+    if [[ -n "$host" && "$host" != none ]]
+    then
+        login_user="$(PROMPT_HELP='The login user ssh connects as; git for the providers.' prompt::ask "login user for $host" git)" || return $?
+    fi
+
+    # Ask for the passphrase only when the key file does not yet exist; an existing
+    # key is reused, never regenerated.
+    keyfile="$(ssh_key::path "$keyname")"
+    passphrase=''
+    [[ -f "$keyfile" ]] || passphrase="$(prompt::ask_secret "SSH key passphrase for $keyname")"
+
+    output::run "Generating the SSH key $keyname" ssh_key::generate "$keyname" "$type" "$bits" "$comment" "$passphrase" || return $?
+
+    if [[ -n "${SSH_AUTH_SOCK:-}" ]]
+    then
+        output::run "Loading $keyname into the SSH agent" ssh_key::register "$keyfile" "$passphrase" || return $?
+    fi
+
+    # The optional Host block, keyed by the key name since there is no workspace slug.
+    if [[ -n "$host" && "$host" != none ]]
+    then
+        alias_name="$(ssh_config::host::alias "$host" "$keyname")"
+        fragment="$(ssh_config::host::filename "$host" "$keyname")"
+
+        if ! ssh_config::host::exist "$fragment"
+        then
+            output::run "Adding the SSH config for $alias_name" ssh_config::host::add "$fragment" "$alias_name" "$host" "$login_user" "$keyfile" || return $?
+        fi
+
+        [[ -z "${SSH_AUTH_SOCK:-}" ]] || ssh_connect::register "$alias_name" "$host" "$keyfile" || true
+    fi
+
+    output::warn "the SSH key $keyname is not tracked in any workspace; manage and remove it by hand"
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::external
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   manage_ssh_keys::main [<name>]
+#
+# Description:
+#   The manage-ssh-keys helper's entry point, for a direct run. With a name it scopes the
+#   run to that workspace's SSH keys: it fails when no such workspace exists, otherwise it
+#   drives that workspace's management menu (manage_ssh_keys::menu). With no name it asks
+#   what the keys are for (manage_ssh_keys::ask_target): a registered workspace drives its
+#   menu (manage_ssh_keys::menu), and the external choice creates a standalone key outside
+#   any workspace (manage_ssh_keys::external). A cancelled picker (exit 2) returns 2.
+#   With no name and no terminal (the PROMPT_INPUT probe fails, as in an unattended run)
+#   it warns that the picker needs an interactive terminal and returns without doing
+#   anything, since it cannot ask which workspace and the standalone flow would have no
+#   answers to read. Writes the usage error to stderr; otherwise drives the menus and
+#   prompts on the terminal and provisions under $HOME.
+#
+# Arguments:
+#   <name>  Optional workspace display name to scope the run to
+#
+# Returns:
+#   0 on success
+#   2 when a named workspace does not exist, or the picker was cancelled
+#   the failing step's exit status when a step fails
+#
+# Example:
+#   manage_ssh_keys::main Personal
+#--------------------------------------------------
+manage_ssh_keys::main() {
+    local name
+    local target
+
+    name="${1:-}"
+
+    # A name scopes the run to that workspace's SSH keys, skipping the picker.
+    if [[ -n "$name" ]]
+    then
+        if ! workspace::exists "$name"
+        then
+            output::fatal "no such workspace: $name"
+
+            return 2
+        fi
+
+        manage_ssh_keys::menu "$name"
+
+        return 0
+    fi
+
+    # No name: the picker (and the standalone flow it routes to) needs a terminal, the
+    # same as the create and remove menus. Probe the prompt input the same way prompt::*
+    # does; without one we cannot ask which workspace, so warn and leave rather than
+    # looping on a prompt that can never be answered.
+    if ! { : <"${PROMPT_INPUT:-/dev/tty}"; } 2>/dev/null
+    then
+        output::warn 'choosing an SSH key target needs an interactive terminal; pass a workspace name to scope the run'
+
+        return 0
+    fi
+
+    # Ask which workspace the keys are for, or to create one outside any.
+    target="$(manage_ssh_keys::ask_target)" || return $?
+
+    case "$target" in
+        external)
+            manage_ssh_keys::external
+            ;;
+        workspace:*)
+            manage_ssh_keys::menu "${target#workspace:}"
+            ;;
+    esac
+}
+[[ -v TEST_FLAG ]] || readonly -f manage_ssh_keys::main
+
+# ─── Constants / globals ────────────────────────────────────────────────────────
+
+# Repository root, resolved from this script's own location (libexec/manage-ssh-keys ->
+# root), so the helper finds its libraries regardless of the caller's working
+# directory. Resolved only when unset, so a caller that sources this script with PROJECT_ROOT
+# already set (libexec/create) does not reassign its readonly value. Made readonly
+# outside tests so specs can reassign it.
+[[ -v PROJECT_ROOT ]] || PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ -v TEST_FLAG ]] || readonly PROJECT_ROOT
+
+# ─── Imports ──────────────────────────────────────────────────────────────────
+# shellcheck source=lib/state.sh
+source "$PROJECT_ROOT/lib/state.sh"
+# shellcheck source=lib/output.sh
+source "$PROJECT_ROOT/lib/output.sh"
+# shellcheck source=lib/prompt.sh
+source "$PROJECT_ROOT/lib/prompt.sh"
+# shellcheck source=lib/workspace.sh
+source "$PROJECT_ROOT/lib/workspace.sh"
+# shellcheck source=lib/ssh_config.sh
+source "$PROJECT_ROOT/lib/ssh_config.sh"
+# shellcheck source=lib/ssh_key.sh
+source "$PROJECT_ROOT/lib/ssh_key.sh"
+# shellcheck source=lib/ssh_connect.sh
+source "$PROJECT_ROOT/lib/ssh_connect.sh"
+# shellcheck source=lib/clone_script.sh
+source "$PROJECT_ROOT/lib/clone_script.sh"
+
+# ─── Execute ──────────────────────────────────────────────────────────────────
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || manage_ssh_keys::main "$@"
