@@ -1,0 +1,23 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+# includes bash scripts with no extension
+indent_size = 4
+
+# YAML (CI workflows, configs)
+[*.{yml,yaml}]
+indent_size = 2
+
+# Markdown (keep trailing spaces for line breaks)
+[*.md]
+indent_size = 2
+trim_trailing_whitespace = false
+
+# Makefiles MUST use tabs
+[Makefile]
+indent_style = tab

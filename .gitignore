@@ -1,0 +1,13 @@
+# shellspec working files
+/.shellspec-local
+/report/
+
+# generated artifacts (coverage reports, etc.)
+/var/
+
+# local Makefile overrides
+/.env.local
+
+# editor and OS noise
+*.swp
+.DS_Store
