@@ -1,0 +1,4 @@
+--shell bash
+--default-path dev/test/shell
+--load-path dev/test/shell
+--require spec_helper
