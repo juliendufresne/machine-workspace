@@ -388,7 +388,7 @@ Describe 'libexec/manage-ssh-keys'
             The path "$HOME/log" should not be exist
         End
 
-        It 'makes one shared key for the selected providers, named from the slug'
+        It 'makes one shared key for the selected providers, named id_<slug>'
             prompt::select_one() { printf 'all'; }
             manage_ssh_keys::pick_providers() { printf 'github.com\ngitlab.com\n'; }
 
@@ -396,7 +396,7 @@ Describe 'libexec/manage-ssh-keys'
             The status should be success
             The stdout should be blank
             The stderr should be blank
-            The contents of file "$HOME/log" should equal 'made personal github.com gitlab.com'
+            The contents of file "$HOME/log" should equal 'made id_personal github.com gitlab.com'
         End
 
         It 'reuses the single existing key when the workspace already has one'
@@ -426,7 +426,7 @@ Describe 'libexec/manage-ssh-keys'
             The status should be success
             The stdout should be blank
             The stderr should be blank
-            The contents of file "$HOME/log" should equal "$(printf 'made personal-github github.com\nmade backup-personal')"
+            The contents of file "$HOME/log" should equal "$(printf 'made id_personal-github github.com\nmade id_backup-personal')"
         End
 
         It 'removes a key then redraws the menu before quitting'

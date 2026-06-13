@@ -16,10 +16,17 @@ Describe 'lib/ssh_key'
     # ==========================================================================
     Describe 'ssh_key::path'
 
-        It 'is the per-keyname key under .ssh in HOME with no algorithm infix'
-            When call ssh_key::path github.com-personal
+        It 'is the keyname as-is under .ssh in HOME, with no prefix or algorithm infix'
+            When call ssh_key::path id_github.com-personal
             The status should be success
             The stdout should equal "$HOME/.ssh/id_github.com-personal"
+            The stderr should be blank
+        End
+
+        It 'uses a typed name verbatim, forcing no id_ prefix onto it'
+            When call ssh_key::path custom-key
+            The status should be success
+            The stdout should equal "$HOME/.ssh/custom-key"
             The stderr should be blank
         End
 
@@ -35,7 +42,7 @@ Describe 'lib/ssh_key'
         ssh-keygen() { printf '%s\n' "$*" >"$HOME/keygen.args"; }
 
         It 'generates an ed25519 key at the keyname path when none exists'
-            When call ssh_key::generate personal ed25519 '' me@example.com secret
+            When call ssh_key::generate id_personal ed25519 '' me@example.com secret
             The status should be success
             The stdout should be blank
             The stderr should be blank
@@ -45,7 +52,7 @@ Describe 'lib/ssh_key'
         End
 
         It 'generates an rsa key with the given bit length when the type is rsa'
-            When call ssh_key::generate personal rsa 2048 me@example.com secret
+            When call ssh_key::generate id_personal rsa 2048 me@example.com secret
             The status should be success
             The stdout should be blank
             The stderr should be blank
@@ -57,7 +64,7 @@ Describe 'lib/ssh_key'
             mkdir -p "$HOME/.ssh"
             : >"$HOME/.ssh/id_personal"
 
-            When call ssh_key::generate personal ed25519 '' me@example.com secret
+            When call ssh_key::generate id_personal ed25519 '' me@example.com secret
             The status should be success
             The stdout should be blank
             The stderr should be blank

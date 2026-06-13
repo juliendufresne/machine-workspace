@@ -27,7 +27,7 @@ set -euo pipefail
 #   key count (manage_ssh_keys::keys) and the removal picker (manage_ssh_keys::pick_remove).
 #   A key is listed once even when it serves several providers: each provider host of
 #   workspace::ssh::hosts is folded onto the key it maps to
-#   (workspace.<slug>.ssh.host.<host>.key, defaulting to the slug), in first-seen order,
+#   (workspace.<slug>.ssh.host.<host>.key, defaulting to id_<slug>), in first-seen order,
 #   with the description "for <h1>, <h2>"; then each host-less extra key
 #   (workspace.<slug>.ssh.extra_keys) is appended with the description "(no provider)".
 #   Reads the registry only; writes the entries to stdout.
@@ -64,7 +64,7 @@ manage_ssh_keys::key_entries() {
         [[ -n "$host" ]] || continue
 
         keyname="$(state::input "workspace.$slug.ssh.host.$host.key" 2>/dev/null || true)"
-        [[ -n "$keyname" ]] || keyname="$slug"
+        [[ -n "$keyname" ]] || keyname="id_$slug"
 
         if [[ -z "${seen[$keyname]:-}" ]]
         then
@@ -433,7 +433,7 @@ manage_ssh_keys::pick_providers() {
 #   the failing step's exit status when provisioning fails
 #
 # Example:
-#   manage_ssh_keys::create Personal personal github.com
+#   manage_ssh_keys::create Personal id_personal github.com
 #--------------------------------------------------
 manage_ssh_keys::create() {
     local alias_name
@@ -670,12 +670,13 @@ manage_ssh_keys::menu() {
                 done
                 ((${#providers[@]} > 0)) || continue   # nothing selected; back to the menu
 
-                # Reuse the single existing key's name, otherwise a fresh slug-named key.
+                # Reuse the single existing key's name, otherwise a fresh slug-named key
+                # carrying the conventional id_ prefix.
                 if ((n == 1))
                 then
                     default_keyname="${keys[0]}"
                 else
-                    default_keyname="$slug"
+                    default_keyname="id_$slug"
                 fi
                 manage_ssh_keys::create "$name" "$default_keyname" "${providers[@]}" || return $?
 
@@ -698,21 +699,21 @@ manage_ssh_keys::menu() {
                 done
                 ((${#providers[@]} > 0)) || [[ -n "$extra" ]] || continue   # nothing selected
 
-                # The default key name is <slug>-<provider>, with the provider's TLD
-                # dropped (github.com -> github), e.g. personal-github.
+                # The default key name is id_<slug>-<provider>, with the provider's TLD
+                # dropped (github.com -> github), e.g. id_personal-github.
                 for host in "${providers[@]}"
                 do
-                    manage_ssh_keys::create "$name" "$slug-${host%%.*}" "$host" || return $?
+                    manage_ssh_keys::create "$name" "id_$slug-${host%%.*}" "$host" || return $?
                 done
 
-                # The custom keys: a suffix names each as <suffix>-<slug>; blank stops.
+                # The custom keys: a suffix names each as id_<suffix>-<slug>; blank stops.
                 if [[ -n "$extra" ]]
                 then
                     while true
                     do
-                        suffix="$(PROMPT_HELP='Names a host-less custom SSH key as <suffix>-<slug>; leave blank to stop.' prompt::ask 'custom SSH key suffix (blank to stop)')" || break
+                        suffix="$(PROMPT_HELP='Names a host-less custom SSH key as id_<suffix>-<slug>; leave blank to stop.' prompt::ask 'custom SSH key suffix (blank to stop)')" || break
                         [[ -n "$suffix" ]] || break
-                        manage_ssh_keys::create "$name" "$suffix-$slug" || return $?
+                        manage_ssh_keys::create "$name" "id_$suffix-$slug" || return $?
                     done
                 fi
 
@@ -817,7 +818,7 @@ manage_ssh_keys::external() {
     # The key name, looped until non-empty: a host-less name under ~/.ssh.
     while true
     do
-        keyname="$(PROMPT_HELP='The filename for the standalone SSH key, stored under ~/.ssh as id_<name>.' prompt::ask 'SSH key name')" || return $?
+        keyname="$(PROMPT_HELP='The filename for the standalone SSH key, stored under ~/.ssh under exactly this name (e.g. id_example).' prompt::ask 'SSH key name')" || return $?
         [[ -z "$keyname" ]] || break
 
         output::warn 'a key name is required'

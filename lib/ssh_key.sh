@@ -29,25 +29,26 @@ set -euo pipefail
 #   ssh_key::path <keyname>
 #
 # Description:
-#   Prints the private-key path for a key, ~/.ssh/id_<keyname> under the caller's
-#   HOME. The keyname is user-chosen and unique (a workspace slug, or a host plus
-#   slug for a per-host key), so each key gets its own file and they never overwrite
-#   one another. There is no ed25519 infix: a key may be ed25519 or rsa, and a
-#   shared key serves several hosts, so the algorithm is not part of the name.
-#   Resolved from HOME at call time, so tests can redirect HOME. Writes the path to
-#   stdout.
+#   Prints the private-key path for a key, ~/.ssh/<keyname> under the caller's
+#   HOME. The keyname is the file's name as-is: the caller owns the naming, so a
+#   default key carries the conventional id_ prefix (id_<slug>, id_<host>-<slug>)
+#   while a name the user typed is used verbatim, without a prefix forced onto it.
+#   Each keyname is unique, so the keys never overwrite one another. There is no
+#   ed25519 infix: a key may be ed25519 or rsa, and a shared key serves several
+#   hosts, so the algorithm is not part of the name. Resolved from HOME at call
+#   time, so tests can redirect HOME. Writes the path to stdout.
 #
 # Arguments:
-#   <keyname>  The key's name (a workspace slug, or <host>-<slug>)
+#   <keyname>  The key's file name under ~/.ssh (e.g. id_github.com-personal)
 #
 # Returns:
 #   0 on success
 #
 # Example:
-#   ssh_key::path github.com-personal
+#   ssh_key::path id_github.com-personal
 #--------------------------------------------------
 ssh_key::path() {
-    printf '%s/.ssh/id_%s' "$HOME" "$1"
+    printf '%s/.ssh/%s' "$HOME" "$1"
 }
 [[ -v TEST_FLAG ]] || readonly -f ssh_key::path
 
