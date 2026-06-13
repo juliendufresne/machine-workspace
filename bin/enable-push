@@ -1,0 +1,962 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# This script switches the origin remote to one of the SSH hosts already defined
+# in ~/.ssh/config (so commits can be pushed) and points the repository at an
+# existing GPG key for signing, reusing keys the machine already holds rather
+# than generating anything. It operates on the git repository containing the
+# current working directory and configures only that repository, never the
+# global git config. The script is self-contained: it sources nothing, so it
+# can be dropped into any repository and run on its own.
+
+# ─── Functions ────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   enable_push::color_enabled <fd>
+#
+# Description:
+#   Reports whether coloured output should go to the given file descriptor,
+#   that is whether it is attached to a terminal. Output redirected to a file
+#   or a pipe (CI logs, command substitution) is left uncoloured. Writes
+#   nothing.
+#
+# Arguments:
+#   <fd>  File descriptor number to test (1 for stdout, 2 for stderr)
+#
+# Returns:
+#   0 when the descriptor is a terminal
+#   1 otherwise
+#
+# Example:
+#   enable_push::color_enabled 1 && printf 'colours on\n'
+#--------------------------------------------------
+enable_push::color_enabled() {
+    [[ -t "$1" ]]
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::color_enabled
+
+#--------------------------------------------------
+# Function:
+#   enable_push::stage <message>
+#
+# Description:
+#   Prints the top-level stage header, "▶ <message>", in bold magenta on a
+#   terminal and plain otherwise, preceded by a blank line. Writes to stdout.
+#
+# Arguments:
+#   <message>  Stage title
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   enable_push::stage 'Repository'
+#--------------------------------------------------
+enable_push::stage() {
+    local message
+
+    message="$1"
+
+    if enable_push::color_enabled 1
+    then
+        printf '\n%b▶ %s%b\n' '\033[1;35m' "${message}" '\033[0m'
+
+        return 0
+    fi
+
+    printf '\n▶ %s\n' "${message}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::stage
+
+#--------------------------------------------------
+# Function:
+#   enable_push::fatal <message>
+#
+# Description:
+#   Prints a flush-left, program-level error, "error: <message>", red on a
+#   terminal and plain otherwise, for a failure that aborts the run. Writes to
+#   stderr.
+#
+# Arguments:
+#   <message>  Text to print
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   enable_push::fatal 'git is not installed'
+#--------------------------------------------------
+enable_push::fatal() {
+    local message
+
+    message="$1"
+
+    if enable_push::color_enabled 2
+    then
+        printf '%berror: %s%b\n' '\033[0;31m' "${message}" '\033[0m' >&2
+
+        return 0
+    fi
+
+    printf 'error: %s\n' "${message}" >&2
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::fatal
+
+#--------------------------------------------------
+# Function:
+#   enable_push::remote_host <url>
+#
+# Description:
+#   Prints the host component of a git remote URL to stdout, handling the
+#   HTTPS form (https://host/owner/repo), both SSH forms
+#   (git@host:owner/repo and ssh://git@host/owner/repo) and a bare host
+#   alias (alias:owner/repo). Strips any scheme and userinfo first, then
+#   keeps everything up to the first ':' or '/'.
+#
+# Arguments:
+#   <url>  A git remote URL in any of the supported transports
+#
+# Returns:
+#   0 always
+#
+# Example:
+#   enable_push::remote_host 'https://github.com/o/r.git'
+#--------------------------------------------------
+enable_push::remote_host() {
+    local host
+    local url
+
+    url="$1"
+
+    url="${url#*://}"
+    url="${url#*@}"
+    host="${url%%[:/]*}"
+
+    printf '%s\n' "${host}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::remote_host
+
+#--------------------------------------------------
+# Function:
+#   enable_push::ssh_config_content <config-file>
+#
+# Description:
+#   Prints the effective content of an SSH client config to stdout: the
+#   file itself, followed by the content of every file it pulls in with an
+#   `Include` directive, recursively. Include globs are expanded with the
+#   same path rules ssh uses - a leading `~/` is the home directory, a
+#   relative path is taken from the including file's directory - so a
+#   config that fans its hosts out across ~/.ssh/config.d/* is flattened
+#   into one stream the parser can walk. A missing or unreadable file
+#   contributes nothing. Reads only the named files.
+#
+# Arguments:
+#   <config-file>  Path to an SSH config file (e.g. ~/.ssh/config)
+#
+# Returns:
+#   0 always (an unreadable file is silently skipped)
+#
+# Example:
+#   enable_push::ssh_config_content "${HOME}/.ssh/config"
+#--------------------------------------------------
+enable_push::ssh_config_content() {
+    local config_file
+    local include_dir
+    local keyword
+    local line
+    local match
+    local stripped
+    local token
+    local value
+    local -a tokens
+
+    config_file="$1"
+
+    [[ -r "${config_file}" ]] || return 0
+
+    include_dir="$( dirname -- "${config_file}" )"
+
+    while IFS= read -r line || [[ -n "${line}" ]]
+    do
+        printf '%s\n' "${line}"
+
+        stripped="${line#"${line%%[![:space:]]*}"}"
+        keyword="${stripped%%[[:space:]=]*}"
+
+        [[ "${keyword,,}" == 'include' ]] || continue
+
+        value="${stripped:${#keyword}}"
+        value="${value#"${value%%[![:space:]=]*}"}"
+
+        read -r -a tokens <<< "${value}"
+        for token in "${tokens[@]+"${tokens[@]}"}"
+        do
+            # ssh expands a leading ~/ in Include paths; match it literally and swap
+            # in $HOME. The tilde is data read from the config, not ours to expand, so
+            # the tilde-in-quotes warning (SC2088) below is a false positive here.
+            # shellcheck disable=SC2088
+            case "${token}" in
+                '~/'*) token="${HOME}/${token#'~/'}" ;;
+                /*) ;;
+                *) token="${include_dir}/${token}" ;;
+            esac
+
+            for match in ${token}
+            do
+                [[ -e "${match}" ]] || continue
+
+                enable_push::ssh_config_content "${match}"
+            done
+        done
+    done < "${config_file}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::ssh_config_content
+
+#--------------------------------------------------
+# Function:
+#   enable_push::emit_host <target> <hostname> <identity-file> [<pattern>...]
+#
+# Description:
+#   Prints a "<host-alias>\t<identity-file>" line to stdout for one parsed
+#   SSH `Host` block when that block's resolved HostName equals the target
+#   (compared case-insensitively, as hostnames are). The alias printed is
+#   the block's first concrete pattern - any pattern containing a wildcard
+#   (`*`, `?`) or negation (`!`) is skipped, since those cannot be used as a
+#   remote host. Emits nothing when the hostname does not match or the block
+#   has no concrete pattern. A helper for
+#   enable_push::matching_ssh_hosts, which calls it once per block.
+#
+# Arguments:
+#   <target>         HostName to match against (e.g. github.com)
+#   <hostname>       The block's HostName value ('' when unset)
+#   <identity-file>  The block's IdentityFile value ('' when unset)
+#   <pattern>...     The block's Host patterns
+#
+# Returns:
+#   0 always
+#
+# Example:
+#   enable_push::emit_host github.com github.com '~/.ssh/id' gh
+#--------------------------------------------------
+enable_push::emit_host() {
+    local hostname
+    local identityfile
+    local pattern
+    local target
+
+    target="$1"
+    hostname="$2"
+    identityfile="$3"
+    shift 3
+
+    [[ -n "${hostname}" && "${hostname,,}" == "${target,,}" ]] || return 0
+
+    for pattern in "$@"
+    do
+        case "${pattern}" in
+            *[*?!]*) continue ;;
+            *) ;;
+        esac
+
+        printf '%s\t%s\n' "${pattern}" "${identityfile}"
+
+        return 0
+    done
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::emit_host
+
+#--------------------------------------------------
+# Function:
+#   enable_push::matching_ssh_hosts <target>
+#
+# Description:
+#   Reads flattened SSH config content on stdin and prints, for every `Host`
+#   block whose HostName equals <target>, a "<host-alias>\t<identity-file>"
+#   line to stdout (one per matching block, in file order). Walks the stream
+#   keyword by keyword - case-insensitive keywords, `key value` and
+#   `key=value` spellings, surrounding quotes stripped - buffering each
+#   block's HostName and first IdentityFile and flushing it through
+#   enable_push::emit_host when the next `Host` line (or end of
+#   input) closes it. Blank and comment lines are ignored.
+#
+# Arguments:
+#   <target>  HostName to match against (e.g. github.com)
+#
+# Returns:
+#   0 always
+#
+# Example:
+#   enable_push::matching_ssh_hosts github.com < flattened-config
+#--------------------------------------------------
+enable_push::matching_ssh_hosts() {
+    local hostname
+    local identityfile
+    local keyword
+    local line
+    local stripped
+    local target
+    local value
+    local -a patterns
+
+    target="$1"
+
+    hostname=''
+    identityfile=''
+    patterns=()
+
+    while IFS= read -r line || [[ -n "${line}" ]]
+    do
+        stripped="${line#"${line%%[![:space:]]*}"}"
+
+        [[ -n "${stripped}" && "${stripped:0:1}" != '#' ]] || continue
+
+        keyword="${stripped%%[[:space:]=]*}"
+        value="${stripped:${#keyword}}"
+        value="${value#"${value%%[![:space:]=]*}"}"
+        value="${value%\"}"
+        value="${value#\"}"
+
+        case "${keyword,,}" in
+            host)
+                enable_push::emit_host "${target}" "${hostname}" "${identityfile}" "${patterns[@]+"${patterns[@]}"}"
+                read -r -a patterns <<< "${value}"
+                hostname=''
+                identityfile=''
+                ;;
+            hostname)
+                hostname="${value}"
+                ;;
+            identityfile)
+                [[ -n "${identityfile}" ]] || identityfile="${value}"
+                ;;
+            *)
+                ;;
+        esac
+    done
+
+    enable_push::emit_host "${target}" "${hostname}" "${identityfile}" "${patterns[@]+"${patterns[@]}"}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::matching_ssh_hosts
+
+#--------------------------------------------------
+# Function:
+#   enable_push::warn <message>
+#
+# Description:
+#   Prints an indented warning line, "  ! <message>", yellow on a terminal and
+#   plain otherwise, for a non-fatal caution the user should see but that does
+#   not fail the run. Writes to stderr.
+#
+# Arguments:
+#   <message>  Text to print
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   enable_push::warn 'no SSH host maps to github.com'
+#--------------------------------------------------
+enable_push::warn() {
+    local message
+
+    message="$1"
+
+    if enable_push::color_enabled 2
+    then
+        printf '  %b! %s%b\n' '\033[0;33m' "${message}" '\033[0m' >&2
+
+        return 0
+    fi
+
+    printf '  ! %s\n' "${message}" >&2
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::warn
+
+#--------------------------------------------------
+# Function:
+#   enable_push::confirm <prompt>
+#
+# Description:
+#   Asks a yes/no question, defaulting to no. Writes "<prompt> [y/N] " to
+#   stderr and reads one line from stdin; succeeds only on an affirmative
+#   reply (y, Y, yes in any case). Used for the single-candidate paths where
+#   there is one obvious choice to accept or decline.
+#
+# Arguments:
+#   <prompt>  The question to display
+#
+# Returns:
+#   0 when the reply is affirmative
+#   1 otherwise (including an empty reply or end of input)
+#
+# Example:
+#   enable_push::confirm 'Use this host?' || return 0
+#--------------------------------------------------
+enable_push::confirm() {
+    local prompt
+    local reply
+
+    prompt="$1"
+
+    printf '%s [y/N] ' "${prompt}" >&2
+    read -r reply || reply=''
+
+    [[ "${reply}" == [yY] || "${reply}" == [yY][eE][sS] ]]
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::confirm
+
+#--------------------------------------------------
+# Function:
+#   enable_push::info <message>
+#
+# Description:
+#   Prints an indented info line, "  • <message>", dim on a terminal and plain
+#   otherwise, for routine progress. Writes to stdout.
+#
+# Arguments:
+#   <message>  Text to print
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   enable_push::info 'origin remote unchanged'
+#--------------------------------------------------
+enable_push::info() {
+    local message
+
+    message="$1"
+
+    if enable_push::color_enabled 1
+    then
+        printf '  %b• %s%b\n' '\033[2m' "${message}" '\033[0m'
+
+        return 0
+    fi
+
+    printf '  • %s\n' "${message}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::info
+
+#--------------------------------------------------
+# Function:
+#   enable_push::menu <prompt> <label>...
+#
+# Description:
+#   Presents a numbered menu and reads a choice. Writes the prompt, one
+#   numbered line per label and a "0) keep current / skip" line to stderr,
+#   then reads one line from stdin. On a valid in-range selection it prints
+#   that 1-based number to stdout and succeeds; on 0, an empty line, a
+#   non-number or an out-of-range number it prints nothing and fails, which
+#   the caller treats as "leave things as they are".
+#
+# Arguments:
+#   <prompt>   The heading shown above the options
+#   <label>... One or more option labels, in order
+#
+# Returns:
+#   0 and prints the chosen 1-based index on a valid selection
+#   1 when the selection is skipped or invalid
+#
+# Example:
+#   choice="$( enable_push::menu 'Pick one:' a b c )" || return 0
+#--------------------------------------------------
+enable_push::menu() {
+    local label
+    local prompt
+    local reply
+    local -i index
+    local -a labels
+
+    prompt="$1"
+    shift
+    labels=( "$@" )
+
+    printf '%s\n' "${prompt}" >&2
+    index=1
+    for label in "${labels[@]}"
+    do
+        printf '  %d) %s\n' "${index}" "${label}" >&2
+        index=$(( index + 1 ))
+    done
+    printf '  0) keep current / skip\n' >&2
+    printf 'Choice: ' >&2
+
+    read -r reply || reply=''
+
+    if [[ ! "${reply}" =~ ^[0-9]+$ ]] || (( reply < 1 || reply > ${#labels[@]} ))
+    then
+        return 1
+    fi
+
+    printf '%d\n' "${reply}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::menu
+
+#--------------------------------------------------
+# Function:
+#   enable_push::remote_path <url>
+#
+# Description:
+#   Prints the "owner/repo[.git]" path of a git remote URL to stdout,
+#   stripping any scheme, userinfo and host so the caller can graft the path
+#   onto a chosen SSH host alias. The mirror of
+#   enable_push::remote_host: between them they split a remote URL
+#   into the parts an scp-style "<alias>:<path>" URL is rebuilt from.
+#
+# Arguments:
+#   <url>  A git remote URL in any of the supported transports
+#
+# Returns:
+#   0 always
+#
+# Example:
+#   enable_push::remote_path 'https://github.com/o/r.git'
+#--------------------------------------------------
+enable_push::remote_path() {
+    local host
+    local path
+    local url
+
+    url="$1"
+
+    url="${url#*://}"
+    url="${url#*@}"
+    host="${url%%[:/]*}"
+    path="${url#"${host}"}"
+    path="${path#[:/]}"
+
+    printf '%s\n' "${path}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::remote_path
+
+#--------------------------------------------------
+# Function:
+#   enable_push::success <message>
+#
+# Description:
+#   Prints an indented success line, "  ✓ <message>", green on a terminal and
+#   plain otherwise. Writes to stdout.
+#
+# Arguments:
+#   <message>  Text to print
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   enable_push::success 'set origin remote to gh:o/r'
+#--------------------------------------------------
+enable_push::success() {
+    local message
+
+    message="$1"
+
+    if enable_push::color_enabled 1
+    then
+        printf '  %b✓ %s%b\n' '\033[0;32m' "${message}" '\033[0m'
+
+        return 0
+    fi
+
+    printf '  ✓ %s\n' "${message}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::success
+
+#--------------------------------------------------
+# Function:
+#   enable_push::configure_remote <repo-root> <origin-url>
+#
+# Description:
+#   Switches the repository's origin remote to an SSH host alias that
+#   resolves to the same HostName the current URL points at. Reads
+#   ~/.ssh/config (Includes followed), collects the host aliases whose
+#   HostName matches the current remote's host and offers them by
+#   "<alias> (<identity-file>)": with one match it asks to confirm, with
+#   several it shows a menu, and with none it prints a warning and leaves the
+#   remote untouched. When a host is chosen it rebuilds the URL as
+#   "<alias>:<owner>/<repo>" and runs `git remote set-url origin`. Reads
+#   ~/.ssh/config and the current home; writes the remote through git and
+#   reports progress through the output library; prompts on stderr.
+#
+# Arguments:
+#   <repo-root>   Path to the git working tree to configure
+#   <origin-url>  The current origin remote URL
+#
+# Returns:
+#   0 on success, when skipped, or when no host matches
+#   N propagated from git remote set-url on failure
+#
+# Example:
+#   enable_push::configure_remote "${root}" "${url}"
+#--------------------------------------------------
+enable_push::configure_remote() {
+    local alias
+    local choice
+    local config_content
+    local host
+    local identityfile
+    local matches
+    local new_url
+    local origin_url
+    local path
+    local repo_root
+    local -a hosts
+    local -a labels
+
+    repo_root="$1"
+    origin_url="$2"
+
+    host="$( enable_push::remote_host "${origin_url}" )"
+
+    # Resolve the SSH config and match in two assignments rather than one piped
+    # process substitution, so neither helper's exit status is masked (SC2312).
+    config_content="$( enable_push::ssh_config_content "${HOME}/.ssh/config" )"
+    matches="$( enable_push::matching_ssh_hosts "${host}" <<< "${config_content}" )"
+
+    hosts=()
+    labels=()
+    while IFS=$'\t' read -r alias identityfile
+    do
+        [[ -n "${alias}" ]] || continue
+
+        hosts+=( "${alias}" )
+        if [[ -n "${identityfile}" ]]
+        then
+            labels+=( "${alias} (${identityfile})" )
+        else
+            labels+=( "${alias} (no identity file)" )
+        fi
+    done <<< "${matches}"
+
+    if (( ${#hosts[@]} == 0 ))
+    then
+        enable_push::warn "no SSH host in ~/.ssh/config maps to ${host} - leaving the origin remote unchanged"
+
+        return 0
+    fi
+
+    if (( ${#hosts[@]} == 1 ))
+    then
+        if ! enable_push::confirm "Use SSH host '${labels[0]}' for the origin remote?"
+        then
+            enable_push::info 'origin remote unchanged'
+
+            return 0
+        fi
+
+        alias="${hosts[0]}"
+    else
+        choice="$( enable_push::menu 'Select the SSH host for the origin remote:' "${labels[@]}" )" || {
+            enable_push::info 'origin remote unchanged'
+
+            return 0
+        }
+
+        alias="${hosts[$(( choice - 1 ))]}"
+    fi
+
+    path="$( enable_push::remote_path "${origin_url}" )"
+    new_url="${alias}:${path}"
+
+    git -C "${repo_root}" remote set-url origin "${new_url}"
+    enable_push::success "set origin remote to ${new_url}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::configure_remote
+
+#--------------------------------------------------
+# Function:
+#   enable_push::gpg_signing_keys
+#
+# Description:
+#   Reads `gpg --list-secret-keys --with-colons` output on stdin and prints
+#   a "<fingerprint>\t<user-id>" line to stdout for each secret key,
+#   pairing each `sec` record's first `fpr` (the primary key fingerprint,
+#   ignoring subkeys) with its first `uid` (the primary user id, which
+#   carries the name, comment and email used to tell keys apart). A key with
+#   no user id still emits, with an empty user-id field.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 always
+#
+# Example:
+#   gpg --list-secret-keys --with-colons | enable_push::gpg_signing_keys
+#--------------------------------------------------
+enable_push::gpg_signing_keys() {
+    local fingerprint
+    local line
+    local uid
+    local -a fields
+
+    fingerprint=''
+    uid=''
+
+    while IFS= read -r line || [[ -n "${line}" ]]
+    do
+        IFS=':' read -r -a fields <<< "${line}"
+
+        case "${fields[0]:-}" in
+            sec)
+                [[ -z "${fingerprint}" ]] || printf '%s\t%s\n' "${fingerprint}" "${uid}"
+                fingerprint=''
+                uid=''
+                ;;
+            fpr)
+                [[ -n "${fingerprint}" ]] || fingerprint="${fields[9]:-}"
+                ;;
+            uid)
+                [[ -n "${uid}" ]] || uid="${fields[9]:-}"
+                ;;
+            *)
+                ;;
+        esac
+    done
+
+    [[ -z "${fingerprint}" ]] || printf '%s\t%s\n' "${fingerprint}" "${uid}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::gpg_signing_keys
+
+#--------------------------------------------------
+# Function:
+#   enable_push::configure_signing_key <repo-root>
+#
+# Description:
+#   Points the repository at an existing GPG key for signing. Lists the
+#   machine's secret keys by their user id, lets the user pick one (or skip),
+#   and on a choice sets user.signingKey to that key's fingerprint and turns
+#   on commit.gpgsign and tag.gpgsign in the repository's local config.
+#   Skips silently with a notice when gpg is absent or holds no secret key.
+#   Reads the gpg keyring; writes the local git config through git and
+#   reports through the output library; prompts on stderr.
+#
+# Arguments:
+#   <repo-root>  Path to the git working tree to configure
+#
+# Returns:
+#   0 on success, when skipped, or when no key is available
+#   N propagated from git config on failure
+#
+# Example:
+#   enable_push::configure_signing_key "${root}"
+#--------------------------------------------------
+enable_push::configure_signing_key() {
+    local choice
+    local fingerprint
+    local keys
+    local raw_keys
+    local repo_root
+    local uid
+    local -a fingerprints
+    local -a labels
+
+    repo_root="$1"
+
+    if ! command -v gpg > /dev/null 2>&1
+    then
+        enable_push::info 'gpg is not installed - skipping signing configuration'
+
+        return 0
+    fi
+
+    # List then parse in two assignments rather than one piped process
+    # substitution, so neither command's exit status is masked (SC2312).
+    raw_keys="$( gpg --list-secret-keys --with-colons 2>/dev/null )" || raw_keys=''
+    keys="$( enable_push::gpg_signing_keys <<< "${raw_keys}" )"
+
+    fingerprints=()
+    labels=()
+    while IFS=$'\t' read -r fingerprint uid
+    do
+        [[ -n "${fingerprint}" ]] || continue
+
+        fingerprints+=( "${fingerprint}" )
+        labels+=( "${uid:-no user id} (${fingerprint})" )
+    done <<< "${keys}"
+
+    if (( ${#fingerprints[@]} == 0 ))
+    then
+        enable_push::info 'no GPG secret key found - skipping signing configuration'
+
+        return 0
+    fi
+
+    choice="$( enable_push::menu 'Select a GPG key to sign commits and tags:' "${labels[@]}" )" || {
+        enable_push::info 'GPG signing unchanged'
+
+        return 0
+    }
+
+    fingerprint="${fingerprints[$(( choice - 1 ))]}"
+
+    git -C "${repo_root}" config --local user.signingKey "${fingerprint}"
+    git -C "${repo_root}" config --local commit.gpgsign true
+    git -C "${repo_root}" config --local tag.gpgsign true
+    enable_push::success "configured commit and tag signing with ${fingerprint}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::configure_signing_key
+
+#--------------------------------------------------
+# Function:
+#   enable_push::prompt_value <prompt> <default>
+#
+# Description:
+#   Reads a single value, offering a default. Writes "<prompt> [<default>]: "
+#   to stderr and reads one line from stdin; prints the entered text to
+#   stdout, or the default when the reply is empty. The caller compares the
+#   result against the default to decide whether anything needs to change.
+#
+# Arguments:
+#   <prompt>   The label shown before the bracketed default
+#   <default>  The value used when the reply is empty
+#
+# Returns:
+#   0 always
+#
+# Example:
+#   name="$( enable_push::prompt_value 'user.name' "${current}" )"
+#--------------------------------------------------
+enable_push::prompt_value() {
+    local default
+    local prompt
+    local reply
+
+    prompt="$1"
+    default="$2"
+
+    printf '%s [%s]: ' "${prompt}" "${default}" >&2
+    read -r reply || reply=''
+
+    if [[ -z "${reply}" ]]
+    then
+        printf '%s\n' "${default}"
+
+        return 0
+    fi
+
+    printf '%s\n' "${reply}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::prompt_value
+
+#--------------------------------------------------
+# Function:
+#   enable_push::configure_identity <repo-root>
+#
+# Description:
+#   Sets the repository's committer identity, defaulting to the effective git
+#   config. Prompts for user.name and user.email, each pre-filled with the
+#   value git already resolves for the repository (whether it comes from the
+#   global file, the system config or a conditional include); when the answer
+#   differs from that default it writes the value to the repository's local
+#   config, and when the default is kept it leaves the local config alone so
+#   the inherited value keeps showing through. Reads the effective git config;
+#   writes the local git config through git and reports through the output
+#   library; prompts on stderr.
+#
+# Arguments:
+#   <repo-root>  Path to the git working tree to configure
+#
+# Returns:
+#   0 on success
+#   N propagated from git config on failure
+#
+# Example:
+#   enable_push::configure_identity "${root}"
+#--------------------------------------------------
+enable_push::configure_identity() {
+    local email
+    local email_default
+    local name
+    local name_default
+    local repo_root
+
+    repo_root="$1"
+
+    name_default="$( git -C "${repo_root}" config user.name 2>/dev/null )" || name_default=''
+    email_default="$( git -C "${repo_root}" config user.email 2>/dev/null )" || email_default=''
+
+    name="$( enable_push::prompt_value 'Git user.name' "${name_default}" )"
+    if [[ -n "${name}" && "${name}" != "${name_default}" ]]
+    then
+        git -C "${repo_root}" config --local user.name "${name}"
+        enable_push::success "set user.name to ${name}"
+    else
+        enable_push::info 'user.name unchanged (using the inherited default)'
+    fi
+
+    email="$( enable_push::prompt_value 'Git user.email' "${email_default}" )"
+    if [[ -n "${email}" && "${email}" != "${email_default}" ]]
+    then
+        git -C "${repo_root}" config --local user.email "${email}"
+        enable_push::success "set user.email to ${email}"
+    else
+        enable_push::info 'user.email unchanged (using the inherited default)'
+    fi
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::configure_identity
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   enable_push::main
+#
+# Description:
+#   Entry point. Configures the git repository that contains the current
+#   working directory in three steps: switch the origin remote to an SSH host,
+#   point at an existing GPG key for signing, and set the committer identity.
+#   Fails up front when git is not installed, the working directory is not
+#   inside a git repository, or that repository has no origin remote, since
+#   every step needs all three. Prints a stage header and delegates; the steps
+#   read ~/.ssh/config and the gpg keyring, prompt on stderr and write only
+#   that repository's local git config.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 on success
+#   1 when git is missing, the working directory is not a git repository, or
+#     there is no origin remote
+#   N propagated from a configuration step on failure
+#
+# Example:
+#   enable_push::main
+#--------------------------------------------------
+enable_push::main() {
+    local origin_url
+    local repo_root
+
+    enable_push::stage 'Repository'
+
+    if ! command -v git > /dev/null 2>&1
+    then
+        enable_push::fatal 'git is not installed'
+
+        return 1
+    fi
+
+    repo_root="$( git rev-parse --show-toplevel 2>/dev/null )" || {
+        enable_push::fatal 'the current directory is not inside a git repository'
+
+        return 1
+    }
+
+    origin_url="$( git -C "${repo_root}" remote get-url origin 2>/dev/null )" || {
+        enable_push::fatal 'no origin remote found in this repository'
+
+        return 1
+    }
+
+    enable_push::configure_remote "${repo_root}" "${origin_url}"
+    enable_push::configure_signing_key "${repo_root}"
+    enable_push::configure_identity "${repo_root}"
+}
+[[ -v TEST_FLAG ]] || readonly -f enable_push::main
+
+# ─── Execute ──────────────────────────────────────────────────────────────────
+
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || enable_push::main "$@"
