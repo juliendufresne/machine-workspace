@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# The show action: a read-only report of each workspace's state. With no name it
+# reports every registered workspace; with a name it reports just that one (exiting
+# 2 when no such workspace exists). For each workspace it prints a stage header and
+# then, under » sub-headers, its git identity (the gitconfig path, whether its
+# IncludeIf block is linked into ~/.gitconfig, the git user, the GPG key) and its
+# SSH keys (show::one::ssh), with the directory check above them. It touches
+# nothing: no prompts, no keys - only the registry and the on-disk config it reports
+# on. The shared registry/query primitives live in lib/workspace.sh.
+
+# ─── Functions ────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   show::one::git <name>
+#
+# Description:
+#   Reports a workspace's git identity for the read-only show action, under a » git
+#   group headed by the gitconfig path: whether its IncludeIf block is linked into
+#   ~/.gitconfig (gitconfig::block::exist), the git user (workspace::git::user_name /
+#   workspace::git::user_email, read back from the per-tree .gitconfig), and the GPG key
+#   for that identity (gpg::key_id_from_email). Each leaf line reflects on-disk
+#   reality; an absent optional item (no git identity, no GPG key) renders as a dim
+#   placeholder so each section is always visible. A read-only report; writes the
+#   lines to stdout through output::group / output::success / output::info.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   show::one::git Personal
+#--------------------------------------------------
+show::one::git() {
+    local email
+    local gpgkey
+    local name
+    local path
+    local slug
+    local user_name
+
+    name="$1"
+    slug="$(workspace::slug "$name")"
+    path="$(workspace::path "$name")"
+
+    output::group "git $path/.gitconfig"
+
+    if gitconfig::block::exist "$slug"
+    then
+        output::success 'linked into ~/.gitconfig' 2
+    else
+        output::info 'not linked into ~/.gitconfig' 2
+    fi
+
+    user_name="$(workspace::git::user_name "$name" 2>/dev/null || true)"
+    email="$(workspace::git::user_email "$name" 2>/dev/null || true)"
+    if [[ -n "$user_name" || -n "$email" ]]
+    then
+        output::success "user $user_name / $email" 2
+    else
+        output::info 'no git identity' 2
+    fi
+
+    if gpgkey="$(gpg::key_id_from_email "$email" 2>/dev/null)"
+    then
+        output::success "gpg key $gpgkey" 2
+    else
+        output::info 'no gpg key' 2
+    fi
+}
+[[ -v TEST_FLAG ]] || readonly -f show::one::git
+
+#--------------------------------------------------
+# Function:
+#   show::one::ssh <name>
+#
+# Description:
+#   Reports a workspace's SSH keys for the read-only show action, under a » ssh
+#   group, one leaf line per key: for each host the workspace grants access to
+#   (workspace::ssh::hosts) the key it maps to (workspace.<slug>.ssh.host.<host>.key,
+#   defaulting to the slug) and its host alias (ssh_config::host::alias), and for
+#   each host-less extra key (workspace.<slug>.ssh.extra_keys) the same key with no
+#   host alias. Each line reflects whether the key file is present on disk
+#   (ssh_key::path); with no keys at all it says so. A read-only report;
+#   writes the lines to stdout through output::group / output::success / output::info.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   show::one::ssh Personal
+#--------------------------------------------------
+show::one::ssh() {
+    local alias_name
+    local -i any
+    local host
+    local keyfile
+    local keyname
+    local name
+    local raw
+    local slug
+
+    name="$1"
+    slug="$(workspace::slug "$name")"
+    any=0
+
+    output::group ssh
+
+    while IFS= read -r host
+    do
+        [[ -n "$host" ]] || continue
+        any=1
+
+        keyname="$(state::input "workspace.$slug.ssh.host.$host.key" 2>/dev/null || true)"
+        [[ -n "$keyname" ]] || keyname="$slug"
+        alias_name="$(ssh_config::host::alias "$host" "$slug")"
+        keyfile="$(ssh_key::path "$keyname")"
+        if [[ -f "$keyfile" ]]
+        then
+            output::success "key $keyname (host $alias_name)" 2
+        else
+            output::info "key $keyname (host $alias_name) missing" 2
+        fi
+    done < <(workspace::ssh::hosts "$name")
+
+    raw="$(state::input "workspace.$slug.ssh.extra_keys" 2>/dev/null || true)"
+    while IFS= read -r keyname
+    do
+        [[ -n "$keyname" ]] || continue
+        any=1
+
+        keyfile="$(ssh_key::path "$keyname")"
+        if [[ -f "$keyfile" ]]
+        then
+            output::success "key $keyname (no host alias)" 2
+        else
+            output::info "key $keyname (no host alias) missing" 2
+        fi
+    done <<<"$raw"
+
+    ((any)) || output::info 'no ssh keys' 2
+}
+[[ -v TEST_FLAG ]] || readonly -f show::one::ssh
+
+#--------------------------------------------------
+# Function:
+#   show::one <name>
+#
+# Description:
+#   Reports the state of one workspace as a nested report: a stage header, then the
+#   directory check. When the directory is missing it says so and stops - with the
+#   identity living in <path>/.gitconfig, nothing under the git or ssh groups can be
+#   retrieved once the tree is gone, so reporting them would mislead. Otherwise it
+#   delegates the » git group (show::one::git) and the » ssh group (show::one::ssh).
+#   A read-only report; writes the lines to stdout.
+#
+# Arguments:
+#   <name>  The workspace display name
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   show::one Personal
+#--------------------------------------------------
+show::one() {
+    local name
+    local path
+
+    name="$1"
+    path="$(workspace::path "$name")"
+
+    output::stage "Workspace $name"
+
+    if [[ -z "$path" || ! -d "$path" ]]
+    then
+        output::info "directory ${path:-(unset)} missing"
+
+        return 0
+    fi
+    output::success "directory $path"
+
+    show::one::git "$name"
+    show::one::ssh "$name"
+}
+[[ -v TEST_FLAG ]] || readonly -f show::one
+
+#--------------------------------------------------
+# Function:
+#   show::all
+#
+# Description:
+#   Reports the state of every registered workspace, each through show::one,
+#   in definition order. With no workspace registered it says so. A read-only
+#   report; writes the lines to stdout.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   show::all
+#--------------------------------------------------
+show::all() {
+    local -i any
+    local name
+
+    any=0
+    while IFS= read -r name
+    do
+        [[ -n "$name" ]] || continue
+        any=1
+
+        show::one "$name"
+    done < <(workspace::list)
+
+    ((any)) || output::info 'no workspaces registered'
+}
+[[ -v TEST_FLAG ]] || readonly -f show::all
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   show::main [<name>]
+#
+# Description:
+#   The show action's entry point. With no name it reports every registered
+#   workspace (show::all). With a name it reports just that one
+#   (show::one) when it exists, and fails when it does not. Writes the usage
+#   error to stderr; otherwise writes the read-only report to stdout.
+#
+# Arguments:
+#   <name>  Optional workspace display name to scope the report to
+#
+# Returns:
+#   0 on success
+#   2 when a name is given but no such workspace exists
+#
+# Example:
+#   show::main Personal
+#--------------------------------------------------
+show::main() {
+    local name
+
+    name="${1:-}"
+
+    # No name: report every registered workspace.
+    if [[ -z "$name" ]]
+    then
+        show::all
+
+        return 0
+    fi
+
+    if ! workspace::exists "$name"
+    then
+        output::fatal "no such workspace: $name"
+
+        return 2
+    fi
+
+    show::one "$name"
+}
+[[ -v TEST_FLAG ]] || readonly -f show::main
+
+# ─── Constants / globals ────────────────────────────────────────────────────────
+
+# Repository root, resolved from this script's own location (libexec/show ->
+# root), so the action finds its libraries regardless of the caller's working
+# directory. Resolved only when unset, so the entrypoint - which sources this script
+# with PROJECT_ROOT already set - does not reassign its readonly value. Made readonly
+# outside tests so specs can reassign it.
+[[ -v PROJECT_ROOT ]] || PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ -v TEST_FLAG ]] || readonly PROJECT_ROOT
+
+# ─── Imports ──────────────────────────────────────────────────────────────────
+# shellcheck source=lib/state.sh
+source "$PROJECT_ROOT/lib/state.sh"
+# shellcheck source=lib/output.sh
+source "$PROJECT_ROOT/lib/output.sh"
+# shellcheck source=lib/gitconfig.sh
+source "$PROJECT_ROOT/lib/gitconfig.sh"
+# shellcheck source=lib/workspace.sh
+source "$PROJECT_ROOT/lib/workspace.sh"
+# shellcheck source=lib/gpg.sh
+source "$PROJECT_ROOT/lib/gpg.sh"
+# shellcheck source=lib/ssh_config.sh
+source "$PROJECT_ROOT/lib/ssh_config.sh"
+# shellcheck source=lib/ssh_key.sh
+source "$PROJECT_ROOT/lib/ssh_key.sh"
+
+# ─── Execute ──────────────────────────────────────────────────────────────────
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || show::main "$@"
