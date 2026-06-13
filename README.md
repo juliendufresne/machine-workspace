@@ -38,6 +38,21 @@ repository into `${XDG_DATA_HOME:-$HOME/.local/share}/workspace`, and then runs
 with `git pull --ff-only` before running `bin/workspace` again, so the same two
 steps bootstrap and refresh.
 
+The quickest path is to download and run in one line. The download is captured
+by command substitution rather than piped, so standard input stays free for the
+prompts:
+
+```sh
+# curl
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/juliendufresne/machine-workspace/main/install.sh)"
+
+# wget
+sh -c "$(wget -qO- https://raw.githubusercontent.com/juliendufresne/machine-workspace/main/install.sh)"
+```
+
+To read the script before you run it, download it to a file first and run it as
+two steps:
+
 ```sh
 # curl
 curl -fsSL https://raw.githubusercontent.com/juliendufresne/machine-workspace/main/install.sh -o install.sh
@@ -48,10 +63,9 @@ wget -qO install.sh https://raw.githubusercontent.com/juliendufresne/machine-wor
 sh install.sh
 ```
 
-Downloading to a file and running it as two steps lets you read the script
-before you run it. Piping the download straight into `sh` works too: the prompts
-read from `/dev/tty`, not standard input, so a pipe taking over stdin does not
-stop them from reaching you.
+Piping the download straight into `sh` works too: the prompts read from
+`/dev/tty`, not standard input, so a pipe taking over stdin does not stop them
+from reaching you.
 
 `git` is required to clone, and `bin/workspace` needs bash >= 4.2: the script
 checks for a suitable bash up front and tells you if it is missing or too old
