@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# The workspace entrypoint: a thin dispatcher over the three actions the tool
+# exposes - create (the default), remove and show, each its own self-contained
+# executable under libexec/. create drives the definition menu and provisions the
+# defined workspaces; remove drives the removal menu and reverses the marked
+# ~/.gitconfig and ~/.ssh blocks; show reports, per workspace, whether its
+# IncludeIf block, ssh blocks and directory exist. Each action takes an optional
+# [name] that scopes it to one workspace, skipping the interactive menus. This
+# script only validates the verb, then calls the matching action's main function,
+# passing the optional [name] through. It sources all three actions up front
+# (alongside lib/output.sh, for the usage error); each libexec owns its own
+# imports, and the shared libraries guard against being sourced twice.
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   workspace::main [<action>] [<name>]
+#
+# Description:
+#   Dispatches the requested action to its main function. create (the default with
+#   no argument), remove and show are run as <action>::main with the optional [name]
+#   passed through. Any other action is a usage error reported with output::fatal.
+#   Writes the usage error to stderr; otherwise writes whatever the dispatched action
+#   writes.
+#
+# Arguments:
+#   <action>  create (default), remove, or show
+#   <name>    Optional workspace name to scope the action to
+#
+# Returns:
+#   2 on an unknown action
+#   the dispatched action's exit status otherwise
+#
+# Example:
+#   workspace::main show Personal
+#--------------------------------------------------
+workspace::main() {
+    local action
+
+    action="${1:-create}"
+
+    # Drop the verb, leaving the optional [name]; nothing to drop on a bare run.
+    if (($# > 0))
+    then
+        shift
+    fi
+
+    case "$action" in
+        create)
+            create::main "$@"
+            ;;
+        remove)
+            remove::main "$@"
+            ;;
+        show)
+            show::main "$@"
+            ;;
+        *)
+            output::fatal "unknown action: $action"
+
+            return 2
+            ;;
+    esac
+}
+[[ -v TEST_FLAG ]] || readonly -f workspace::main
+
+# ─── Constants / globals ────────────────────────────────────────────────────────
+
+# Repository root, resolved from this script's own location (bin/workspace ->
+# root), so the tool finds its libraries and the libexec actions regardless of the
+# caller's working directory. Made readonly outside tests so specs can reassign it.
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ -v TEST_FLAG ]] || readonly PROJECT_ROOT
+
+# ─── Imports ──────────────────────────────────────────────────────────────────
+# shellcheck source=lib/output.sh
+source "$PROJECT_ROOT/lib/output.sh"
+# shellcheck source=libexec/create
+source "$PROJECT_ROOT/libexec/create"
+# shellcheck source=libexec/remove
+source "$PROJECT_ROOT/libexec/remove"
+# shellcheck source=libexec/show
+source "$PROJECT_ROOT/libexec/show"
+
+# ─── Execute ──────────────────────────────────────────────────────────────────
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || workspace::main "$@"
