@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Non-interactive askpass for ssh-add. ssh-add never reads a passphrase from stdin;
+# it asks a terminal or, when SSH_ASKPASS points at a program, runs that program
+# and reads the passphrase from its stdout. This is that program: it prints the
+# passphrase carried in the SSH_PASSPHRASE environment variable, so a key
+# can be loaded into ssh-agent unattended without the passphrase ever touching the
+# disk (it lives only in the environment, for the moment ssh-add reads it).
+# Run by ssh-add via ssh_key::register, not directly.
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+#--------------------------------------------------
+# Function:
+#   ssh_askpass::main
+#
+# Description:
+#   Prints the passphrase from the SSH_PASSPHRASE environment variable (empty
+#   when unset), the one line ssh-add reads from an SSH_ASKPASS program. Writes the
+#   passphrase to stdout.
+#
+# Arguments:
+#   N/A
+#
+# Returns:
+#   0 on success
+#
+# Example:
+#   ssh_askpass::main
+#--------------------------------------------------
+ssh_askpass::main() {
+    printf '%s\n' "${SSH_PASSPHRASE:-}"
+}
+[[ -v TEST_FLAG ]] || readonly -f ssh_askpass::main
+
+# ─── Execute ──────────────────────────────────────────────────────────────────
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || ssh_askpass::main "$@"
