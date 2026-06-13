@@ -1,0 +1,2 @@
+# Follow `source` directives into sibling library files for cross-file checks.
+external-sources=true
