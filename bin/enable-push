@@ -604,6 +604,7 @@ enable_push::configure_remote() {
     local repo_root
     local -a hosts
     local -a labels
+    local -A seen_alias
 
     repo_root="$1"
     origin_url="$2"
@@ -617,9 +618,16 @@ enable_push::configure_remote() {
 
     hosts=()
     labels=()
+    # The same alias can surface more than once - a Host block duplicated across
+    # the config and an included file, say - and every match for one alias rebuilds
+    # the identical origin URL, so a repeat is pure noise. Keep the first sighting of
+    # each alias and drop the rest.
+    seen_alias=()
     while IFS=$'\t' read -r alias identityfile
     do
         [[ -n "${alias}" ]] || continue
+        [[ -z "${seen_alias[${alias}]:-}" ]] || continue
+        seen_alias[${alias}]=1
 
         hosts+=( "${alias}" )
         if [[ -n "${identityfile}" ]]
